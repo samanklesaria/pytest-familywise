@@ -1,3 +1,5 @@
+<img src="./pytest-random-logo.png" style="zoom:25%;" />
+
 # pytest-random
 
 A pytest plugin for running multiple randomized tests while controlling the
@@ -192,4 +194,4 @@ uv run pdoc pytest_random -o docs/
 The HTML output is in `docs/`.
 
 [docs-dev-img]: https://img.shields.io/badge/docs-dev-blue.svg
-[docs-dev-url]: https://samanklesaria.github.io/sizecheck/latest
+[docs-dev-url]: https://samanklesaria.github.io/pytest-random/latest
