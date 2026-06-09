@@ -190,4 +190,4 @@ uv run pdoc pytest_random -o docs/
 The HTML output is in `docs/`.
 
 [docs-dev-img]: https://img.shields.io/badge/docs-dev-blue.svg
-[docs-dev-url]: https://samanklesaria.github.io/pytest-random/latest
+[docs-dev-url]: https://samanklesaria.github.io/pytest-random
