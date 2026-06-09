@@ -1,0 +1,22 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pytest-random"
+version = "0.1.0"
+description = "Pytest plugin for Holm-Bonferroni correction of randomized tests"
+requires-python = ">=3.9"
+dependencies = ["pytest>=7.0", "scipy>=1.9"]
+
+[project.entry-points."pytest11"]
+random = "pytest_random"
+
+[tool.hatch.build.targets.wheel]
+packages = ["pytest_random"]
+
+[dependency-groups]
+dev = ["pdoc>=14"]
+
+[tool.pdoc]
+output-directory = "docs"
