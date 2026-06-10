@@ -21,11 +21,10 @@ applied once to the full set.
 
 ## Installation and loading
 
-Install the package:
+Add the package as a dev dependency:
 
 ```
-pip install pytest-random        # not yet on PyPI — install from source
-uv pip install -e .
+pip add --dev pytest-random
 ```
 
 That is all that is needed.  The package declares a `pytest11` entry point:
@@ -37,49 +36,39 @@ random = "pytest_random"
 ```
 
 pytest scans installed `pytest11` entry points at startup and loads matching
-modules automatically.  The fixtures (`pvalue`, `ztest_sample_size`, etc.) are
+modules automatically.  The fixtures (`assertNotReject`, `ztest_sample_size`, etc.) are
 defined at module level in `pytest_random`, so they become available in every
 test file without any import or `conftest.py` change.
 
-If you are working from a source checkout that has **not** been installed, add
-the following to your project's `conftest.py` to load the plugin explicitly:
-
-```python
-# conftest.py
-pytest_plugins = ["pytest_random"]
-```
 
 ## Quick example
 
 ```python
 import numpy as np
 import scipy.stats
-import pytest
 
-# tests/test_rng.py
-
-def test_uniform_marginals(ks_sample_size, pvalue):
+def test_uniform_marginals(ks_sample_size, assertNotReject):
     """Each output coordinate of our RNG should be marginally uniform."""
     n = ks_sample_size(effect_size=0.05)   # detect CDF deviation >= 5 pp
     samples = np.random.rand(n)
     result = scipy.stats.kstest(samples, "uniform")
-    pvalue(result.pvalue)
+    assertNotReject(result.pvalue)
 
 
-def test_normal_mean_zero(ztest_sample_size, pvalue):
-    """Standardised output should have mean zero."""
+def test_normal_mean_zero(ztest_sample_size, assertNotReject):
+    """Standardised output should have mean zero"""
     n = ztest_sample_size(effect_size=0.3)   # Cohen's d = 0.3
     samples = np.random.randn(n)
     _, p = scipy.stats.ttest_1samp(samples, 0.0)
-    pvalue(p)
+    assertNotReject(p)
 
 
-def test_discrete_distribution(chisquare_sample_size, pvalue):
+def test_discrete_distribution(chisquare_sample_size, assertNotReject):
     """A categorical sampler should match its target probabilities."""
     n = chisquare_sample_size(effect_size=0.2, df=4)   # Cohen's w = 0.2
     observed = np.random.multinomial(n, [0.2] * 5)
     _, p = scipy.stats.chisquare(observed)
-    pvalue(p)
+    assertNotReject(p)
 ```
 
 Run with:
@@ -128,22 +117,25 @@ spirit of providing per-test sizing.
 
 ## Fixtures
 
-### `pvalue`
+### `assertNotReject`
 
 ```python
-def test_something(pvalue):
+def test_something(assertNotReject):
     p = run_statistical_test()
-    pvalue(p)   # registers the p-value; plugin decides pass/fail
+    assertNotReject(p)   # registers the p-value; plugin decides pass/fail
 ```
 
-Calling `pvalue(p)` with a value outside [0, 1] raises `ValueError`.  If a test
-raises an exception before `pvalue` is called, it fails normally and is excluded
-from the Holm-Bonferroni set.
+The test passes if the null hypothesis is *not* rejected after Holm-Bonferroni
+correction (i.e. the p-value is large enough).  It fails if H0 is rejected.
+
+Calling `assertNotReject(p)` with a value outside [0, 1] raises `ValueError`.
+If a test raises an exception before `assertNotReject` is called, it fails
+normally and is excluded from the Holm-Bonferroni set.
 
 ### `ztest_sample_size`
 
 ```python
-n = ztest_sample_size(effect_size=0.5)              # two-sided (default)
+n = ztest_sample_size(effect_size=0.5)               # two-sided (default)
 n = ztest_sample_size(effect_size=0.5, two_sided=False)
 ```
 
@@ -178,16 +170,6 @@ $$n \ge \frac{\left(\sqrt{\ln(2/\alpha)} + \sqrt{\ln(2/\beta)}\right)^2}{2\Delta
 where $\beta = 1 - \text{power}$.  For `two_sample=True` the effective sample size for the
 two-sample KS statistic is $n_1 n_2/(n_1+n_2) = n_\text{each}/2$ (equal groups), so the
 returned per-group count is double the formula above.
-
-## API reference
-
-Generated with [pdoc](https://pdoc.dev):
-
-```
-uv run pdoc pytest_random -o docs/
-```
-
-The HTML output is in `docs/`.
 
 [docs-dev-img]: https://img.shields.io/badge/docs-dev-blue.svg
 [docs-dev-url]: https://samanklesaria.github.io/pytest-random

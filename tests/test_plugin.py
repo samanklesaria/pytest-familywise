@@ -17,165 +17,204 @@ def run(pytester, src: str, alpha: float = 0.05):
 # Single-test cases
 # ---------------------------------------------------------------------------
 
-def test_single_low_pvalue_passes(pytester):
+def test_passes_when_data_consistent_with_h0(pytester):
+    """A large p-value means data is consistent with H0 — test passes."""
     result = run(pytester, """
-        def test_foo(pvalue):
-            pvalue(0.001)
+        def test_foo(assertNotReject):
+            assertNotReject(0.9)
     """)
     result.assert_outcomes(passed=1)
 
 
-def test_single_high_pvalue_fails(pytester):
+def test_fails_when_h0_rejected(pytester):
+    """A very small p-value means H0 is rejected — test fails."""
     result = run(pytester, """
-        def test_foo(pvalue):
-            pvalue(0.9)
+        def test_foo(assertNotReject):
+            assertNotReject(0.001)
     """)
     result.assert_outcomes(failed=1)
 
 
-def test_single_pvalue_exactly_at_alpha_passes(pytester):
-    # With n=1: threshold = alpha/1 = alpha; p <= threshold -> pass
+def test_rejected_at_boundary(pytester):
+    # n=1: threshold = alpha = 0.05; p = 0.05 <= threshold -> rejected -> fail
     result = run(pytester, """
-        def test_foo(pvalue):
-            pvalue(0.05)
-    """, alpha=0.05)
-    result.assert_outcomes(passed=1)
-
-
-def test_single_pvalue_just_above_alpha_fails(pytester):
-    result = run(pytester, """
-        def test_foo(pvalue):
-            pvalue(0.051)
+        def test_foo(assertNotReject):
+            assertNotReject(0.05)
     """, alpha=0.05)
     result.assert_outcomes(failed=1)
+
+
+def test_not_rejected_just_above_alpha(pytester):
+    # n=1: threshold = alpha = 0.05; p = 0.051 > threshold -> not rejected -> pass
+    result = run(pytester, """
+        def test_foo(assertNotReject):
+            assertNotReject(0.051)
+    """, alpha=0.05)
+    result.assert_outcomes(passed=1)
 
 
 # ---------------------------------------------------------------------------
 # Holm-Bonferroni step-down logic
 # ---------------------------------------------------------------------------
 
-def test_holm_bonferroni_stops_at_first_failure(pytester):
-    # n=3, alpha=0.05
-    # sorted p-values: 0.01, 0.04, 0.007  ->  0.007, 0.01, 0.04
-    # k=1: threshold=0.05/3=0.0167; 0.007<=0.0167 -> PASS
-    # k=2: threshold=0.05/2=0.025;  0.01 <=0.025  -> PASS
-    # k=3: threshold=0.05/1=0.05;   0.04 <=0.05   -> PASS
+def test_all_pass_when_all_pvalues_large(pytester):
+    """When all p-values are large (data consistent with H0), all tests pass."""
     result = run(pytester, """
-        def test_a(pvalue): pvalue(0.01)
-        def test_b(pvalue): pvalue(0.04)
-        def test_c(pvalue): pvalue(0.007)
+        def test_a(assertNotReject): assertNotReject(0.5)
+        def test_b(assertNotReject): assertNotReject(0.7)
+        def test_c(assertNotReject): assertNotReject(0.3)
     """)
     result.assert_outcomes(passed=3)
 
 
-def test_holm_bonferroni_second_fails_rest_also_fail(pytester):
-    # n=3, alpha=0.05
-    # sorted: 0.01, 0.03, 0.07
-    # k=1: threshold=0.0167; 0.01<=0.0167 -> PASS
-    # k=2: threshold=0.025;  0.03>0.025   -> FAIL (stop)
-    # k=3: stop -> FAIL
+def test_all_fail_when_all_pvalues_tiny(pytester):
+    """When all p-values are tiny, every null hypothesis is rejected."""
+    # n=4, sorted: 0.001, 0.002, 0.003, 0.004
+    # k=1: threshold=0.05/4=0.0125; 0.001<=0.0125 -> REJECT
+    # k=2: threshold=0.05/3=0.0167; 0.002<=0.0167 -> REJECT
+    # k=3: threshold=0.05/2=0.025;  0.003<=0.025  -> REJECT
+    # k=4: threshold=0.05/1=0.05;   0.004<=0.05   -> REJECT
     result = run(pytester, """
-        def test_a(pvalue): pvalue(0.01)
-        def test_b(pvalue): pvalue(0.03)
-        def test_c(pvalue): pvalue(0.07)
+        def test_a(assertNotReject): assertNotReject(0.001)
+        def test_b(assertNotReject): assertNotReject(0.002)
+        def test_c(assertNotReject): assertNotReject(0.003)
+        def test_d(assertNotReject): assertNotReject(0.004)
     """)
-    result.assert_outcomes(passed=1, failed=2)
+    result.assert_outcomes(failed=4)
 
 
-def test_all_fail_when_first_exceeds_threshold(pytester):
-    # n=2, alpha=0.05
-    # sorted: 0.04, 0.08
-    # k=1: threshold=0.05/2=0.025; 0.04>0.025 -> FAIL (stop)
-    # k=2: stop -> FAIL
+def test_correction_protects_marginal_pvalues(pytester):
+    """P-values that would be rejected alone are protected by the correction.
+
+    With n=2, the first threshold is alpha/2 = 0.025.  A p-value of 0.04
+    would be rejected at alpha=0.05 in a single test, but Holm-Bonferroni
+    tightens the threshold so 0.04 > 0.025 -> not rejected -> pass.
+    """
     result = run(pytester, """
-        def test_a(pvalue): pvalue(0.04)
-        def test_b(pvalue): pvalue(0.08)
-    """)
-    result.assert_outcomes(failed=2)
-
-
-def test_all_pass_when_all_small(pytester):
-    result = run(pytester, """
-        def test_a(pvalue): pvalue(0.001)
-        def test_b(pvalue): pvalue(0.002)
-        def test_c(pvalue): pvalue(0.003)
-        def test_d(pvalue): pvalue(0.004)
-    """)
-    result.assert_outcomes(passed=4)
-
-
-# ---------------------------------------------------------------------------
-# Non-pvalue tests are unaffected
-# ---------------------------------------------------------------------------
-
-def test_normal_passing_test_unaffected(pytester):
-    result = run(pytester, """
-        def test_ordinary():
-            assert 1 + 1 == 2
-
-        def test_stat(pvalue):
-            pvalue(0.001)
+        def test_a(assertNotReject): assertNotReject(0.04)
+        def test_b(assertNotReject): assertNotReject(0.08)
     """)
     result.assert_outcomes(passed=2)
 
 
-def test_normal_failing_test_unaffected(pytester):
+def test_step_down_rejects_only_smallest(pytester):
+    """Only the smallest p-value is rejected; once the step-down stops, the
+    rest pass even though some are below the uncorrected alpha.
+
+    sorted: 0.01, 0.03, 0.07
+    k=1: threshold=0.05/3=0.0167; 0.01<=0.0167 -> REJECT (fail)
+    k=2: threshold=0.05/2=0.025;  0.03>0.025   -> stop   (pass)
+    k=3: stop                                             (pass)
+    """
+    result = run(pytester, """
+        def test_a(assertNotReject): assertNotReject(0.01)
+        def test_b(assertNotReject): assertNotReject(0.03)
+        def test_c(assertNotReject): assertNotReject(0.07)
+    """)
+    result.assert_outcomes(passed=2, failed=1)
+
+
+def test_step_down_rejects_all_when_all_below_thresholds(pytester):
+    """When every p-value falls below its Holm-Bonferroni threshold, all are
+    rejected.
+
+    sorted: 0.007, 0.01, 0.04
+    k=1: threshold=0.05/3=0.0167; 0.007<=0.0167 -> REJECT
+    k=2: threshold=0.05/2=0.025;  0.01 <=0.025  -> REJECT
+    k=3: threshold=0.05/1=0.05;   0.04 <=0.05   -> REJECT
+    """
+    result = run(pytester, """
+        def test_a(assertNotReject): assertNotReject(0.01)
+        def test_b(assertNotReject): assertNotReject(0.04)
+        def test_c(assertNotReject): assertNotReject(0.007)
+    """)
+    result.assert_outcomes(failed=3)
+
+
+# ---------------------------------------------------------------------------
+# Non-assertNotReject tests are unaffected
+# ---------------------------------------------------------------------------
+
+def test_ordinary_passing_test_unaffected(pytester):
+    """A plain assertion test coexists with an assertNotReject test."""
+    result = run(pytester, """
+        def test_ordinary():
+            assert 1 + 1 == 2
+
+        def test_stat(assertNotReject):
+            assertNotReject(0.9)
+    """)
+    result.assert_outcomes(passed=2)
+
+
+def test_ordinary_failing_test_unaffected(pytester):
+    """A plain assertion failure is independent of assertNotReject results."""
     result = run(pytester, """
         def test_ordinary():
             assert False
 
-        def test_stat(pvalue):
-            pvalue(0.001)
+        def test_stat(assertNotReject):
+            assertNotReject(0.9)
     """)
     result.assert_outcomes(passed=1, failed=1)
 
 
 # ---------------------------------------------------------------------------
-# Exception in a pvalue test => fails as an error, not statistically
+# Exceptions in assertNotReject tests fail normally
 # ---------------------------------------------------------------------------
 
-def test_exception_before_pvalue_call_fails_normally(pytester):
+def test_exception_before_assertNotReject_fails_normally(pytester):
+    """An exception before assertNotReject is called fails the test normally,
+    without entering the Holm-Bonferroni set."""
     result = run(pytester, """
-        def test_raises(pvalue):
+        def test_raises(assertNotReject):
             raise RuntimeError("boom")
-            pvalue(0.001)
+            assertNotReject(0.9)
     """)
-    # Uncaught exceptions in the test body are reported as 'failed', not 'errors'
     result.assert_outcomes(failed=1)
 
 
-def test_exception_after_pvalue_call(pytester):
-    # p-value was set, but test also raised -> test fails normally;
-    # the plugin should not override it to passed.
+def test_exception_after_assertNotReject_still_fails(pytester):
+    """An exception after assertNotReject is called still fails the test
+    normally — the plugin does not override it to passed."""
     result = run(pytester, """
-        def test_raises(pvalue):
-            pvalue(0.001)
-            raise RuntimeError("boom after pvalue")
+        def test_raises(assertNotReject):
+            assertNotReject(0.9)
+            raise RuntimeError("boom after assertNotReject")
     """)
     result.assert_outcomes(failed=1)
 
 
 # ---------------------------------------------------------------------------
-# custom alpha
+# Custom alpha
 # ---------------------------------------------------------------------------
 
-def test_custom_alpha(pytester):
-    # alpha=0.01, n=1: threshold=0.01; p=0.05>0.01 -> FAIL
+def test_stricter_alpha_protects_more(pytester):
+    """A stricter alpha=0.01 does not reject p=0.02 (which alpha=0.05 would)."""
     result = run(pytester, """
-        def test_foo(pvalue):
-            pvalue(0.05)
+        def test_foo(assertNotReject):
+            assertNotReject(0.02)
+    """, alpha=0.01)
+    result.assert_outcomes(passed=1)
+
+
+def test_stricter_alpha_still_rejects_very_small(pytester):
+    """Even at alpha=0.01, a very small p-value is still rejected."""
+    result = run(pytester, """
+        def test_foo(assertNotReject):
+            assertNotReject(0.005)
     """, alpha=0.01)
     result.assert_outcomes(failed=1)
 
 
 # ---------------------------------------------------------------------------
-# pvalue validation
+# p-value validation
 # ---------------------------------------------------------------------------
 
 def test_invalid_pvalue_raises(pytester):
     result = run(pytester, """
-        def test_foo(pvalue):
-            pvalue(1.5)
+        def test_foo(assertNotReject):
+            assertNotReject(1.5)
     """)
     result.assert_outcomes(failed=1)
 
@@ -184,17 +223,34 @@ def test_invalid_pvalue_raises(pytester):
 # Parametrized tests
 # ---------------------------------------------------------------------------
 
-def test_parametrized(pytester):
-    # Each param gets its own p-value; treated as independent tests.
-    # n=3, alpha=0.05; p-values: 0.001, 0.002, 0.003 -> all pass
+def test_parametrized_all_consistent_with_h0(pytester):
+    """Each parametrized variant gets its own p-value; all large -> all pass."""
     result = run(pytester, """
         import pytest
 
-        @pytest.mark.parametrize("p", [0.001, 0.002, 0.003])
-        def test_param(pvalue, p):
-            pvalue(p)
+        @pytest.mark.parametrize("p", [0.5, 0.6, 0.7])
+        def test_param(assertNotReject, p):
+            assertNotReject(p)
     """)
     result.assert_outcomes(passed=3)
+
+
+def test_parametrized_mixed(pytester):
+    """Parametrized tests with mixed results: small p rejected, large p pass.
+
+    sorted: 0.001, 0.5, 0.9
+    k=1: threshold=0.05/3=0.0167; 0.001<=0.0167 -> REJECT (fail)
+    k=2: threshold=0.05/2=0.025;  0.5>0.025     -> stop   (pass)
+    k=3: stop                                             (pass)
+    """
+    result = run(pytester, """
+        import pytest
+
+        @pytest.mark.parametrize("p", [0.001, 0.5, 0.9])
+        def test_param(assertNotReject, p):
+            assertNotReject(p)
+    """)
+    result.assert_outcomes(passed=2, failed=1)
 
 
 # ---------------------------------------------------------------------------

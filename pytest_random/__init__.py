@@ -1,10 +1,10 @@
 """Pytest plugin for Holm-Bonferroni correction of randomized tests.
 
-Tests register a p-value via the ``pvalue`` fixture.  After all tests run,
-the plugin sorts the p-values and applies the Holm-Bonferroni step-down
+Tests register a p-value via the ``assertNotReject`` fixture.  After all tests
+run, the plugin sorts the p-values and applies the Holm-Bonferroni step-down
 procedure to control the family-wise error rate (FWER).  A test "passes" when
-its p-value is small enough to reject the null hypothesis after correction;
-it "fails" otherwise.
+its p-value is too large to reject the null hypothesis after correction;
+it "fails" when the null hypothesis is rejected.
 
 Three fixtures expose required-sample-size calculations so tests can be
 sized for the desired per-test power before running:
@@ -40,11 +40,14 @@ import math
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Set
 
+from scipy.stats import norm
+from scipy.optimize import brentq
+from scipy.stats import chi2, ncx2
 import pytest
 
 __all__ = [
     "PValueReporter",
-    "pvalue",
+    "assertNotReject",
     "ztest_sample_size",
     "chisquare_sample_size",
     "ks_sample_size",
@@ -71,7 +74,6 @@ def _ztest_n(alpha: float, power: float, effect_size: float, two_sided: bool = T
     int
         Required sample size (per group for a two-sample test).
     """
-    from scipy.stats import norm
     z_alpha = norm.ppf(1 - alpha / 2) if two_sided else norm.ppf(1 - alpha)
     z_beta = norm.ppf(power)
     return math.ceil(((z_alpha + z_beta) / effect_size) ** 2)
@@ -92,8 +94,6 @@ def _chisquare_n(alpha: float, power: float, effect_size: float, df: int) -> int
     int
         Required total sample size.
     """
-    from scipy.optimize import brentq
-    from scipy.stats import chi2, ncx2
 
     critical = chi2.ppf(1 - alpha, df)
 
@@ -145,14 +145,14 @@ def _ks_n(alpha: float, power: float, effect_size: float, two_sample: bool = Fal
 # ---------------------------------------------------------------------------
 
 class PValueReporter:
-    """Callable returned by the ``pvalue`` fixture.
+    """Callable returned by the ``assertNotReject`` fixture.
 
     The test calls it once with its computed p-value:
 
     ```python
-    def test_foo(pvalue):
+    def test_foo(assertNotReject):
         p = run_experiment()
-        pvalue(p)
+        assertNotReject(p)
     ```
     """
 
@@ -226,11 +226,12 @@ class HolmBonferroniPlugin:
         for k, (nodeid, p) in enumerate(sorted_items, 1):
             threshold = self.alpha / (n - k + 1)
             if not stop_rejecting and p <= threshold:
-                passed = True
-            else:
-                stop_rejecting = True
+                # Null hypothesis rejected — assertNotReject fails
                 passed = False
                 self._failed_nodeids.add(nodeid)
+            else:
+                stop_rejecting = True
+                passed = True
 
             self._corrected.append(_CorrectedResult(
                 nodeid=nodeid,
@@ -272,7 +273,8 @@ class HolmBonferroniPlugin:
             threshold = threshold_map[nodeid]
             report.outcome = "failed"
             report.longrepr = (
-                f"Holm-Bonferroni: p={p_value:.6f} > threshold={threshold:.6f}"
+                f"Holm-Bonferroni: p={p_value:.6f} <= threshold={threshold:.6f}"
+                f" (null hypothesis rejected)"
             )
             stats.setdefault("failed", []).append(report)
 
@@ -334,18 +336,19 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 @pytest.fixture
-def pvalue(request: pytest.FixtureRequest) -> PValueReporter:
-    """Register a p-value for Holm-Bonferroni correction.
+def assertNotReject(request: pytest.FixtureRequest) -> PValueReporter:
+    """Assert that the null hypothesis is not rejected after Holm-Bonferroni correction.
 
     Call the returned object once inside your test with the computed p-value.
-    The plugin will determine pass/fail after all tests finish.
+    The test passes if the p-value is too large to reject H0; it fails if
+    H0 is rejected.
 
     Example:
 
     ```python
-    def test_chi_squared(pvalue):
+    def test_chi_squared(assertNotReject):
         stat, p = scipy.stats.chisquare(observed, expected)
-        pvalue(p)
+        assertNotReject(p)
     ```
     """
     plugin: HolmBonferroniPlugin = request.config._holm_plugin  # type: ignore[attr-defined]
@@ -361,12 +364,12 @@ def ztest_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     Usage:
 
     ```python
-    def test_mean(ztest_sample_size, pvalue):
+    def test_mean(ztest_sample_size, assertNotReject):
         n = ztest_sample_size(effect_size=0.5)          # two-sided
         n = ztest_sample_size(effect_size=0.5, two_sided=False)
         data = generate(n)
         _, p = scipy.stats.ttest_1samp(data, 0)
-        pvalue(p)
+        assertNotReject(p)
     ```
 
     ``effect_size`` is Cohen's d (mean difference / pooled SD).
@@ -387,11 +390,11 @@ def chisquare_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     Usage:
 
     ```python
-    def test_distribution(chisquare_sample_size, pvalue):
+    def test_distribution(chisquare_sample_size, assertNotReject):
         n = chisquare_sample_size(effect_size=0.3, df=4)
         counts = generate(n)
         _, p = scipy.stats.chisquare(counts, expected)
-        pvalue(p)
+        assertNotReject(p)
     ```
 
     ``effect_size`` is Cohen's w; ``df`` is the degrees of freedom
@@ -412,12 +415,12 @@ def ks_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     Usage:
 
     ```python
-    def test_uniform(ks_sample_size, pvalue):
+    def test_uniform(ks_sample_size, assertNotReject):
         n = ks_sample_size(effect_size=0.1)              # one-sample
         n = ks_sample_size(effect_size=0.1, two_sample=True)  # per-group
         data = generate(n)
         p = scipy.stats.kstest(data, 'uniform').pvalue
-        pvalue(p)
+        assertNotReject(p)
     ```
 
     ``effect_size`` is the maximum absolute CDF difference ||F − G||_∞.
