@@ -1,5 +1,3 @@
-<img src="./pytest-familywise-logo.png" style="zoom:25%;" />
-
 # pytest-familywise
 
 A pytest plugin for running multiple randomized tests while controlling the
