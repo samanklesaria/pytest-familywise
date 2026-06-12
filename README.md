@@ -110,10 +110,15 @@ receive a relaxed threshold once earlier hypotheses have been rejected.
 | `--holm-alpha` | `0.05` | Family-wise error rate for the Holm-Bonferroni procedure |
 | `--power` | `0.8` | Per-test power used by the sample-size fixtures |
 
-`--power` is per-test, not family-wise.  The sample-size fixtures use the
-nominal `--holm-alpha` directly (not a Bonferroni-adjusted per-test level),
-which is anticonservative for the first tests in the ordering but matches the
-spirit of providing per-test sizing.
+`--power` is per-test, not family-wise.  The sample-size fixtures use
+Holm-Bonferroni corrected significance levels rather than the raw alpha.  At
+collection time, the plugin counts the number of `assertNotReject` tests (*m*)
+and then assigns `alpha / (m - k + 1)` to the *k*-th test that requests a
+sample size, in execution order.  The first test receives the most stringent
+threshold (`alpha / m`) and therefore the largest sample size; later tests
+receive progressively relaxed thresholds and smaller samples.  Because of this,
+it is worth ordering your test suite so that more computationally expensive
+tests run later, where the required sample sizes are smaller.
 
 ## Fixtures
 

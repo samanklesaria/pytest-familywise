@@ -13,6 +13,13 @@ sized for the desired per-test power before running:
 * ``chisquare_sample_size(effect_size, df)``           – Cohen's w
 * ``ks_sample_size(effect_size, two_sample=False)``    – max |F−G|, via DKW
 
+The sample-size fixtures automatically use Holm-Bonferroni corrected
+significance levels rather than the raw familywise alpha.  The plugin counts
+the number of tests that use ``assertNotReject`` (*m*) at collection time,
+then assigns ``alpha / (m - k + 1)`` to the *k*-th test that requests a
+sample size (in execution order).  This ensures each test is properly powered
+for the threshold it may face during the step-down procedure.
+
 Loading
 -------
 The package registers itself with pytest via the ``pytest11`` entry point in
@@ -193,6 +200,41 @@ class HolmBonferroniPlugin:
         self._deferred_reports: Dict[str, pytest.TestReport] = {}
         self._corrected: List[_CorrectedResult] = []
         self._failed_nodeids: Set[str] = set()
+        # Number of tests participating in the correction (uses assertNotReject).
+        self._num_pvalue_tests: int = 0
+        # Per-test corrected alpha for sample-size fixtures, assigned in order.
+        self._corrected_alphas: Dict[str, float] = {}
+        self._alpha_counter: int = 0
+
+    # ------------------------------------------------------------------
+    # Hook: count tests that participate in the correction
+    # ------------------------------------------------------------------
+
+    @pytest.hookimpl
+    def pytest_collection_modifyitems(self, items: List[pytest.Item]) -> None:
+        self._num_pvalue_tests = sum(
+            1 for item in items if "assertNotReject" in getattr(item, "fixturenames", ())
+        )
+
+    # ------------------------------------------------------------------
+    # Corrected alpha for sample-size fixtures
+    # ------------------------------------------------------------------
+
+    def get_corrected_alpha(self, nodeid: str) -> float:
+        """Return the Holm-Bonferroni corrected alpha for a test's sample-size calculation.
+
+        Assigns alpha / (m - k + 1) where m is the total number of tests and
+        k is the 1-based order in which tests request a sample size.
+        """
+        if nodeid not in self._corrected_alphas:
+            m = self._num_pvalue_tests
+            k = self._alpha_counter + 1
+            if m == 0 or k > m:
+                self._corrected_alphas[nodeid] = self.alpha
+            else:
+                self._corrected_alphas[nodeid] = self.alpha / (m - k + 1)
+            self._alpha_counter += 1
+        return self._corrected_alphas[nodeid]
 
     # ------------------------------------------------------------------
     # Hook: capture call-phase reports for deferred tests
@@ -359,7 +401,12 @@ def assertNotReject(request: pytest.FixtureRequest) -> PValueReporter:
 
 @pytest.fixture
 def ztest_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
-    """Return required n for a z-test at the session's alpha and power.
+    """Return required n for a z-test at the session's power and corrected alpha.
+
+    The significance level used is ``alpha / (m - k + 1)`` where *m* is the
+    total number of ``assertNotReject`` tests and *k* is the position (in
+    execution order) at which this test requests a sample size.  This matches
+    the Holm-Bonferroni step-down thresholds so each test is properly powered.
 
     Usage:
 
@@ -376,9 +423,10 @@ def ztest_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     Returns per-group n for a two-sample test.
     """
     plugin: HolmBonferroniPlugin = request.config._holm_plugin  # type: ignore[attr-defined]
+    alpha = plugin.get_corrected_alpha(request.node.nodeid)
 
     def compute(effect_size: float, two_sided: bool = True) -> int:
-        return _ztest_n(plugin.alpha, plugin.power, effect_size, two_sided)
+        return _ztest_n(alpha, plugin.power, effect_size, two_sided)
 
     return compute
 
@@ -386,6 +434,9 @@ def ztest_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
 @pytest.fixture
 def chisquare_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     """Return required n for a chi-square goodness-of-fit test.
+
+    Uses the same Holm-Bonferroni corrected alpha as ``ztest_sample_size``
+    (see its docstring for details).
 
     Usage:
 
@@ -401,9 +452,10 @@ def chisquare_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     (number of categories − 1 for goodness-of-fit).
     """
     plugin: HolmBonferroniPlugin = request.config._holm_plugin  # type: ignore[attr-defined]
+    alpha = plugin.get_corrected_alpha(request.node.nodeid)
 
     def compute(effect_size: float, df: int) -> int:
-        return _chisquare_n(plugin.alpha, plugin.power, effect_size, df)
+        return _chisquare_n(alpha, plugin.power, effect_size, df)
 
     return compute
 
@@ -411,6 +463,9 @@ def chisquare_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
 @pytest.fixture
 def ks_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     """Return required n for a KS test, sized via the DKW inequality.
+
+    Uses the same Holm-Bonferroni corrected alpha as ``ztest_sample_size``
+    (see its docstring for details).
 
     Usage:
 
@@ -428,8 +483,9 @@ def ks_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     (assuming equal group sizes).
     """
     plugin: HolmBonferroniPlugin = request.config._holm_plugin  # type: ignore[attr-defined]
+    alpha = plugin.get_corrected_alpha(request.node.nodeid)
 
     def compute(effect_size: float, two_sample: bool = False) -> int:
-        return _ks_n(plugin.alpha, plugin.power, effect_size, two_sample)
+        return _ks_n(alpha, plugin.power, effect_size, two_sample)
 
     return compute
