@@ -8,7 +8,7 @@ version = "0.1.1"
 description = "Pytest plugin for Holm-Bonferroni correction of randomized tests"
 readme = "README.md"
 requires-python = ">=3.9"
-dependencies = ["pytest>=7.0", "scipy>=1.9"]
+dependencies = ["pytest>=7.0", "scipy>=1.9", "numpy>=1.22"]
 license = "MIT"
 Homepage = "https://github.com/samanklesaria/pytest-familywise"
 Documentation = "https://samanklesaria.github.io/pytest-familywise/pytest_familywise.html"
