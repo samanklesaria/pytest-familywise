@@ -192,41 +192,23 @@ def test_groups_are_identical(assertNotReject, group_a, group_b):
 Sign-flipping (`data * rng.choice([-1, 1], size=len(data))`) is the third common
 idiom, for H0s that assert symmetry about zero.
 
-## How the step-down procedures work
+---
 
-Both procedures are expressed as **adjusted p-values**: each raw p-value is
-mapped to an adjusted value, and $H_0$ is rejected when
-$\tilde{p} \le \alpha$.  Monotonicity of the adjusted values *is* the step-down
-stop condition — once one test survives, every larger p-value does too.
+## The Step Down Procedures
 
-### Holm-Bonferroni
+Both procedures are expressed as **adjusted p-values**: each raw p-value $p_i$ is
+mapped to an adjusted value $\tilde{p}_i$, and null hypothesis $i$ is rejected when
+$\tilde{p}_i \le \alpha$.  The p-values are adjusted to be monotonically increasing, so the first time we fail to reject a null hypothesis, we'll fail to reject the rest of the null hypotheses as well. To be specific, say we have $m$ tests with p-values sorted ascending as $p_1 \le p_2 \le \cdots \le p_m$. 
 
-Given $m$ tests with p-values sorted ascending as $p_1 \le p_2 \le \cdots \le p_m$:
+For Holm Bonferroni, $\tilde{p}_k = \max\left(\tilde{p}_{k-1},\ \min(1,\ (m - k + 1)\, p_k)\right)$. Let $m_0$ be the number of true null hypotheses. Say our first true rejected null hypothesis was \(L\). The number of previously considered hypotheses \(L-1\) can't be more than the number of false hypotheses \(m - m_0\). If we had previously considered a true hypothesis and accepted it, monotonicity would require us to accept hypothesis $L$ too. So \(L - 1 \leq m - m_0\). For us to reject \(L\), we'd have to have \(p_L \leq \frac{\alpha}{m - L + 1} \leq \frac{\alpha}{m_0}\). Taking a union bound over all $m_0$ true null hypotheses bounds the family-wise error rate by $\alpha$. 
 
-$$\tilde{p}_k = \max\left(\tilde{p}_{k-1},\ \min(1,\ (m - k + 1)\, p_k)\right)$$
+For Westfall Young, $\tilde{p}_k = \max\left(\tilde{p}_{k-1},P( c(S_k) < p_k) \right)$ where $S_k = \{k, k+1, \dotsc, m\}$, the random variable $c(S) = \min_{j \in S} P_j$ , and $P$ is distributed according to the joint null distribution.  Say $L$ is the first true null hypothesis in our ordering. By monotonicity, the event that we reject a true null hypothesis is the same as the event that we reject hypothesis $L$. We reject at $L$ when $P( c(S_L) \leq p_L) \leq \alpha$. Let $I_0$ be the set of true null hypotheses. Because \(L\) is the first true null, $I_0 \subseteq S_L$. So $c(S_L) \leq c(I_0)$ and $\{c(S_L) < p_L\} \subseteq \{c(I_0) \leq p_L\}$.  Let $F$ be the CDF of $c(I_0)$ so that our rejection event is contained in $\{F(p_L) \leq \alpha\}$. Let $p_L'$ be the smallest observed p-value for hypotheses in $I_0$. As $p_L$ was the smallest observed p-value for hypotheses in $S_k$, $p'_L \geq p_L$. So $\{F(p_L) \leq \alpha\} \subseteq \{F(p'_L) \leq \alpha\}$. As $p'_L$ also has cdf $F$, so we can write this as $\{F(F^{-1}(u)) \leq \alpha\}$ where $u$ is uniformly distributed. This occurs with probability $\alpha$. 
 
-Equivalently: at rank $k$ the threshold is $\alpha / (m - k + 1)$, and you reject
-from $k = 1$ upward until a p-value exceeds its threshold.  This is more powerful
-than Bonferroni ($\alpha/m$ for all tests) because later ranks receive a relaxed
-threshold once earlier hypotheses have been rejected.
 
-### Westfall-Young (minP)
 
-Instead of bounding the joint null distribution, estimate it.  Each test supplies
-$B$ p-values computed under $H_0$, forming a $B \times m$ null matrix $P$.  For
-each resample $b$, take the running minimum over the tail of the ordering — the
-null distribution of the *smallest* p-value among the not-yet-rejected
-hypotheses:
+Note that to estimate $P(c(S_L) \leq p_L)$ on Westfall-Young, we take samples of $c(S_L)$ and count the number below $p_L$. This means the number of samples (given by the `--resamples` argument) must exceed $1/\alpha$ for any rejection to be possible.
 
-$$q_{b,k} = \min(q_{b,k+1},\ P_{b,\pi(k)}), \qquad \tilde{p}_k = \max\left(\tilde{p}_{k-1},\ \frac{\#\\{b : q_{b,k} \le p_k\\}}{B}\right)$$
 
-With independent tests this reproduces the exact $1 - (1-p)^m$ correction (Holm's
-$m \cdot p$ is its conservative bound).  With perfectly correlated tests the
-adjusted p-value collapses back to the raw p-value — two tests that are really
-the same test cost each other no power, which is something Holm cannot express.
-
-Note the granularity floor: the smallest attainable adjusted p-value is $1/B$, so
-`--resamples` must exceed $1/\alpha$ for any rejection to be possible.
 
 ## CLI options
 
