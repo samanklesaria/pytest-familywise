@@ -1,10 +1,11 @@
 """Pytest plugin for family-wise error rate control of randomized tests.
 
-Tests register a p-value via the ``assertNotReject`` fixture.  After all tests
-run, the plugin applies a step-down multiple-comparison procedure to control the
-family-wise error rate (FWER).  A test "passes" when its p-value is too large to
-reject the null hypothesis after correction; it "fails" when the null hypothesis
-is rejected.
+Tests register a *sampler* via the ``assertNotReject`` fixture: a callable that
+draws a group of data from the generator it is handed and returns the p-value
+for that group.  After all tests run, the plugin applies a step-down
+multiple-comparison procedure to control the family-wise error rate (FWER).  A
+test "passes" when its p-value is too large to reject the null hypothesis after
+correction; it "fails" when the null hypothesis is rejected.
 
 Two procedures are available via ``--correction``:
 
@@ -17,6 +18,18 @@ Two procedures are available via ``--correction``:
 
 Both are expressed as adjusted p-values: each test's raw p-value is mapped to an
 adjusted value, and the null hypothesis is rejected when ``adjusted <= alpha``.
+
+Group-sequential testing
+------------------------
+Under ``--groupsize`` the sampler is called once per group rather than once:
+every test draws a group, the correction is applied to the whole family, tests
+whose null is rejected stop drawing, and the survivors draw another group.
+Because each group is fresh independent data, ``Z_k = k**-0.5 * sum_j
+Phi^-1(1 - p_j)`` has *exactly* the canonical sequential law -- for any test
+statistic -- so an exact Pocock boundary applies.  The boundary is inverted
+into a single sequential p-value per test, which then goes through the same
+step-down machinery.  See the README for the derivation, and ``_cross_prob``
+for the numerics.
 
 Other fixtures expose required-sample-size calculations so tests can be
 sized for the desired per-test power before running.
@@ -60,10 +73,12 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Callable, Dict, List, Optional, Sequence, Set
 
 import numpy as np
-from numpy.random import default_rng
+from numpy.random import SeedSequence, default_rng
+from scipy.signal import fftconvolve
 from scipy.stats import norm
 from scipy.optimize import brentq
 from scipy.stats import chi2, ncx2
@@ -73,6 +88,15 @@ import pytest
 # that runs are reproducible by default; draw b uses default_rng(_BASE_SEED + b)
 # identically in every test, which is what aligns the null columns.
 _BASE_SEED = 0x5EED
+
+# p-values are clamped to this before the probit transform, so that an exact 0
+# (permutation tests, underflowed tails) gives a large-but-finite z ~ 37.
+_P_FLOOR = 1e-300
+
+# Tail cutoff for the Armitage-McPherson grid, in standard deviations.  The
+# neglected mass is ~6e-16, below the recursion's 1e-8 target.
+_GRID_TAIL = 8.0
+_GRID_STEP = 0.02
 
 
 def _ztest_n(alpha: float, power: float, effect_size: float, two_sided: bool = True) -> int:
@@ -106,37 +130,248 @@ def _validated(p: float) -> float:
         raise ValueError(f"p-value must be in [0, 1], got {p!r}")
     return float(p)
 
+
+def _cross_prob(b: float, k_looks: int, drift: float = 0.0) -> float:
+    """``P(exists k <= K : Z_k >= b)`` for the canonical sequential statistic.
+
+    ``Z_k = S_k / sqrt(k)`` where ``S_k`` is the sum of *k* i.i.d. ``N(drift, 1)``
+    increments, so ``corr(Z_j, Z_k) = sqrt(j / k)``.  With ``drift=0`` this is
+    the null crossing probability that defines a Pocock boundary (and, read
+    backwards, the sequential p-value); with ``drift=mu`` it is the design's
+    power against that alternative.
+
+    Evaluated by the Armitage-McPherson recursion on the sub-density ``f_k`` of
+    ``S_k`` restricted to "no earlier look crossed"::
+
+        f_1(s)     = phi(s - drift)                          for s < b
+        f_{k+1}(s) = int_{u < b sqrt(k)} f_k(u) phi(s - u - drift) du
+        P          = 1 - int_{s < b sqrt(K)} f_K(s) ds
+
+    Independent increments turn the K-dimensional orthant probability into K
+    one-dimensional convolutions, which is both exact and far cheaper than
+    ``scipy.stats.multivariate_normal.cdf`` -- that routine is randomised
+    quasi-Monte-Carlo, so it varies run to run and would make a reported
+    p-value irreproducible.
+    """
+    k = int(k_looks)
+    if k < 1:
+        raise ValueError(f"k_looks must be >= 1, got {k_looks!r}")
+    if k == 1:
+        # Exact, and keeps the non-sequential path bit-identical to reporting p.
+        return float(norm.sf(b - drift))
+
+    # Above b*sqrt(j) the sub-density is identically zero, so the grid needs to
+    # reach only the largest of those cutoffs.  Below there is no boundary, so
+    # that edge is a genuine tail cutoff: S_j has mean j*drift and sd sqrt(j),
+    # and j*drift - 8*sqrt(j) dips before it rises, so take the minimum.
+    roots = np.sqrt(np.arange(1, k + 1))
+    hi = float(b * roots[-1]) if b >= 0 else float(b)
+    lo = float(np.min(np.arange(1, k + 1) * drift - _GRID_TAIL * roots))
+    if hi <= lo:
+        return 1.0
+
+    n = int((hi - lo) / _GRID_STEP) | 1  # odd, for Simpson
+    n = min(max(n, 401), 8001)
+    s, h = np.linspace(lo, hi, n, retstep=True)
+    weights = np.ones(n)
+    weights[1:-1:2] = 4.0
+    weights[2:-1:2] = 2.0
+    weights *= h / 3.0
+
+    # Truncate with a partial-cell mask rather than snapping to the nearest
+    # grid point: each point stands for a cell of width h, and the cutoff
+    # b*sqrt(j) generally falls inside one.  Snapping makes the result jump by
+    # O(h) as b moves, which shows up directly as noise in a reported p-value.
+    def truncated(density: "np.ndarray", cutoff: float) -> "np.ndarray":
+        return density * np.clip((cutoff - s) / h + 0.5, 0.0, 1.0)
+
+    kernel = norm.pdf(np.arange(-(n - 1), n) * h - drift)
+    f = norm.pdf(s - drift)
+    for j in range(1, k):
+        f = truncated(f, float(b * roots[j - 1]))
+        f = fftconvolve(weights * f, kernel)[n - 1:2 * n - 1]
+    f = truncated(f, float(b * roots[-1]))
+    return float(min(1.0, max(0.0, 1.0 - float((weights * f).sum()))))
+
+
+@lru_cache(maxsize=None)
+def _pocock_c(alpha: float, k_looks: int) -> float:
+    "The constant Pocock boundary: the b with ``_cross_prob(b, K) == alpha``."
+    return float(brentq(
+        lambda b: _cross_prob(b, k_looks) - alpha, -8.0, 12.0, xtol=1e-9,
+    ))
+
+
+@lru_cache(maxsize=None)
+def _cross_prob_grid(k_looks: int) -> tuple:
+    """Tabulate ``log _cross_prob(., K)`` for bulk evaluation.
+
+    Only the Westfall-Young null columns go through this -- B values per test
+    per look, which is far too many to run the recursion for.  Their precision
+    needs are modest: an adjusted p-value from B resamples is a multiple of
+    1/B, so interpolation error well under that is invisible.  Observed
+    p-values always use the exact recursion.
+    """
+    grid = np.linspace(-8.0, 10.0, 361)
+    logp = np.log(np.maximum(
+        [_cross_prob(float(b), k_looks) for b in grid], _P_FLOOR,
+    ))
+    return tuple(grid), tuple(logp)
+
+
+def _cross_prob_many(bs: "np.ndarray", k_looks: int) -> "np.ndarray":
+    "Vectorised ``_cross_prob`` by log-interpolation; see ``_cross_prob_grid``."
+    if k_looks == 1:
+        return np.asarray(norm.sf(bs), dtype=float)
+    grid, logp = _cross_prob_grid(k_looks)
+    return np.exp(np.interp(bs, np.asarray(grid), np.asarray(logp)))
+
+
+def _group_drift(
+    n_at: Callable[[float, float], int], alpha: float, groupsize: int
+) -> float:
+    """Per-group drift ``mu = E[Phi^-1(1 - p_j)]`` for a group of *groupsize*.
+
+    ``n_at(alpha, power)`` is one of the existing sample-size functions with its
+    effect size already bound.  Invert it to find the power a single group
+    achieves at level *alpha*, then map that back onto the probit scale.
+
+    ponytail: exact when the probit-transformed p-value is normal with unit
+    variance (the location-normal case, i.e. the z-test); an approximation for
+    chi-square and KS.  It only selects the number of looks -- a wrong mu costs
+    power, never error-rate control.
+
+    Returns 0.0 when a single group carries no usable signal at all, which the
+    caller reports as a group size too small for the test.
+    """
+    lo, hi = alpha + 1e-9, 1.0 - 1e-9
+    if n_at(alpha, lo) > groupsize:
+        return 0.0
+    if n_at(alpha, hi) <= groupsize:
+        power = hi
+    else:
+        for _ in range(60):
+            mid = (lo + hi) / 2.0
+            if n_at(alpha, mid) <= groupsize:
+                lo = mid
+            else:
+                hi = mid
+        power = lo
+    return float(norm.ppf(power) + norm.ppf(1.0 - alpha))
+
+
+def _n_looks(mu: float, alpha: float, power: float, cap: int = 60) -> int:
+    "Smallest K whose Pocock design attains *power* against per-group drift mu."
+    if mu <= 0.0:
+        raise ValueError("per-group drift must be positive")
+    for k in range(1, cap + 1):
+        if _cross_prob(_pocock_c(alpha, k), k, drift=mu) >= power:
+            return k
+    raise ValueError(
+        f"no group-sequential design with <= {cap} looks reaches power "
+        f"{power} at alpha={alpha:g} with this group size; raise --groupsize"
+    )
+
+@dataclass
+class _LookState:
+    """Group-sequential state for one test, accumulated across looks.
+
+    Lives on the plugin rather than on the reporter: later looks re-run the
+    test, so the function-scoped ``assertNotReject`` fixture is rebuilt each
+    time and cannot carry anything forward.
+    """
+    k_looks: int = 1
+    looks_done: int = 0
+    z_sum: float = 0.0
+    z_max: float = -math.inf
+    value: Optional[float] = None                 # sequential p-value p*
+    nulls: Optional["np.ndarray"] = None          # (B,) null p*, WY only
+    null_z_sum: Optional["np.ndarray"] = None
+    null_z_max: Optional["np.ndarray"] = None
+    adjusted: Optional[float] = None
+    active: bool = True
+
+
 class PValueReporter:
     "Callable returned by the ``assertNotReject`` fixture."
 
-    def __init__(self, needs_null: bool = False, resamples: int = 0) -> None:
-        self.value: Optional[float] = None
-        self.nulls: Optional["np.ndarray"] = None  # (B,) float64
-        self._needs_null = needs_null
-        self._resamples = resamples
+    def __init__(self, plugin: "FamilywisePlugin", nodeid: str) -> None:
+        self._plugin = plugin
+        self._nodeid = nodeid
 
     def __call__(
         self,
-        p: float,
+        sampler: Callable[..., float],
         null_sample: Optional[Callable[..., float]] = None,
     ) -> None:
-        if self._needs_null and null_sample is None:
+        plugin = self._plugin
+        if not callable(sampler):
+            raise TypeError(
+                "assertNotReject takes a sampler, not a p-value: "
+                "assertNotReject(fn), where fn(rng) draws one group of data "
+                "from rng and returns the p-value for that group"
+            )
+        if plugin.correction == "westfall-young" and null_sample is None:
             raise ValueError(
                 "the westfall-young correction requires "
-                "assertNotReject(p, null_sample=fn), where fn(rng) recomputes "
+                "assertNotReject(fn, null_sample=g), where g(rng) recomputes "
                 "this test's p-value on an H0-imposing transform of the "
                 "observed data (permute, sign-flip, center-then-bootstrap)"
             )
-        self.value = _validated(p)
-        if null_sample is not None:
-            self.nulls = np.fromiter(
+        state = plugin._state.get(self._nodeid)
+        if state is None:
+            if plugin.groupsize > 0:
+                raise ValueError(
+                    "--groupsize needs the number of looks, which comes from a "
+                    "sample-size fixture; call ztest_sample_size (or "
+                    "chisquare_/ks_) before assertNotReject"
+                )
+            state = plugin._state.setdefault(self._nodeid, _LookState())
+
+        if plugin._backfill:
+            # Reconstructing null columns for looks already taken; the observed
+            # statistic must not advance and the sampler must not be called.
+            self._resample(state, null_sample, range(1, state.looks_done + 1), reset=True)
+            return
+
+        state.looks_done += 1
+        look = state.looks_done
+        p = _validated(sampler(plugin.rng))
+        if state.k_looks == 1:
+            state.value = p  # degenerate case: p* == p, exactly
+        else:
+            state.z_sum += float(norm.isf(min(max(p, _P_FLOOR), 1.0)))
+            state.z_max = max(state.z_max, state.z_sum / math.sqrt(look))
+            state.value = _cross_prob(state.z_max, state.k_looks)
+        if null_sample is not None and plugin._nulls_open:
+            self._resample(state, null_sample, [look], reset=False)
+
+    def _resample(self, state, null_sample, looks, reset: bool) -> None:
+        "Accumulate the null path for the given looks; see ``_cross_prob``."
+        plugin = self._plugin
+        if null_sample is None:
+            return
+        count = plugin.resamples
+        if reset or state.null_z_sum is None:
+            state.null_z_sum = np.zeros(count)
+            state.null_z_max = np.full(count, -np.inf)
+        for look in looks:
+            draws = np.fromiter(
                 (
-                    _validated(null_sample(default_rng(_BASE_SEED + b)))
-                    for b in range(self._resamples)
+                    _validated(null_sample(plugin.null_rng(look, b)))
+                    for b in range(count)
                 ),
                 dtype=float,
-                count=self._resamples,
+                count=count,
             )
+            if state.k_looks == 1:
+                state.nulls = draws
+                return
+            state.null_z_sum += norm.isf(np.clip(draws, _P_FLOOR, 1.0))
+            state.null_z_max = np.maximum(
+                state.null_z_max, state.null_z_sum / math.sqrt(look)
+            )
+        state.nulls = _cross_prob_many(state.null_z_max, state.k_looks)
 
 
 def _holm_adjusted(
@@ -207,8 +442,10 @@ class _CorrectedResult:
     "Internal result record"
     nodeid: str
     p_value: float
-    adjusted: float
+    adjusted: Optional[float]
     passed: bool
+    looks: int = 1
+    k_looks: int = 1
 
 @dataclass(eq=False)
 class FamilywisePlugin:
@@ -218,11 +455,24 @@ class FamilywisePlugin:
     power: float
     correction: str
     resamples: int
+    groupsize: int = 0
 
-    _reporters: Dict[str, PValueReporter] = field(init=False, default_factory=dict)
+    rng: "np.random.Generator" = field(init=False, default_factory=default_rng)
+    _state: Dict[str, _LookState] = field(init=False, default_factory=dict)
     _corrected: List[_CorrectedResult] = field(init=False, default_factory=list)
     # Tests participating in the correction (i.e. using assertNotReject).
     _participating: Set[str] = field(init=False, default_factory=set)
+    # Failures raised by a test during a later look, keyed by nodeid.
+    _errors: Dict[str, object] = field(init=False, default_factory=dict)
+    _nulls_open: bool = field(init=False, default=True)
+    _need_backfill: bool = field(init=False, default=False)
+    _backfill: bool = field(init=False, default=False)
+
+    def __post_init__(self) -> None:
+        # Outside sequential mode the null resampling is eager, as it always
+        # was.  Under --groupsize it is deferred until it could change a
+        # verdict; see _decide.
+        self._nulls_open = self.groupsize <= 0
 
     # Record which tests participate in the correction
     @pytest.hookimpl(trylast=True)
@@ -238,30 +488,171 @@ class FamilywisePlugin:
             return self.alpha
         return self.alpha / len(self._participating)
 
-    def _apply_correction(self) -> None:
-        pvalue_items = [
-            (nodeid, r.value, r.nulls)
-            for nodeid, r in self._reporters.items()
-            if r.value is not None
-        ]
-        if not pvalue_items:
+    def null_rng(self, look: int, b: int) -> "np.random.Generator":
+        """Generator for Westfall-Young resample *b* at *look*.
+
+        Keyed on (look, b) alone, never on the test, so that every test sees the
+        same draw at the same index and their null columns stay aligned -- which
+        is what lets the procedure measure their correlation.
+        """
+        if self.groupsize <= 0:
+            return default_rng(_BASE_SEED + b)
+        return default_rng(SeedSequence([_BASE_SEED, look, b]))
+
+    def plan(
+        self, nodeid: str, n_at: Callable[[float, float], int], alpha: float
+    ) -> int:
+        """Sample size for one test, and under --groupsize its number of looks.
+
+        ``n_at(alpha, power)`` is one of the sample-size functions with its
+        effect size bound.  In sequential mode the answer is always the group
+        size -- the effect size moves the number of looks instead.
+        """
+        if self.groupsize <= 0:
+            return n_at(alpha, self.power)
+        mu = _group_drift(n_at, alpha, self.groupsize)
+        if mu <= 0.0:
+            raise ValueError(
+                f"a single group of {self.groupsize} samples has no power to "
+                f"detect this effect at α={alpha:g}, so no number of groups "
+                f"will: combining groups is weaker than pooling them.  Raise "
+                f"--groupsize (a fixed-sample run needs "
+                f"n={n_at(alpha, self.power)})"
+            )
+        k = _n_looks(mu, alpha, self.power)
+        state = self._state.setdefault(nodeid, _LookState())
+        state.k_looks = max(state.k_looks, k)  # a test may size twice
+        return self.groupsize
+
+    # ---- group-sequential driver -------------------------------------------
+
+    @pytest.hookimpl(hookwrapper=True)
+    def pytest_runtestloop(self, session: pytest.Session):
+        """Look 1 is the ordinary run; re-run survivors for the later looks.
+
+        Re-running the protocol (rather than calling samplers at session end)
+        is what keeps every sampler inside a live call phase, with its fixtures
+        set up and its exceptions reported as ordinary test failures.
+        """
+        yield
+        if self.groupsize <= 0 or session.shouldstop or session.shouldfail:
             return
+        max_looks = max((st.k_looks for st in self._state.values()), default=1)
+        look = 1
+        while True:
+            self._settle(session)
+            if self._stop_for_maxfail(session) or look >= max_looks:
+                break
+            look += 1
+            due = self._due(session, look)
+            if not due:
+                break
+            self._rerun(due)
+        self._settle(session)
 
-        sorted_items = sorted(pvalue_items, key=lambda x: x[1])
-        adjust = CORRECTIONS[self.correction]
-        adjusted = adjust(
-            [p for _, p, _ in sorted_items],
-            [nulls for _, _, nulls in sorted_items],
+    def _settle(self, session: pytest.Session) -> None:
+        "Decide; if that opened the null gate, backfill the columns and redecide."
+        self._decide()
+        if self._need_backfill:
+            self._need_backfill = False
+            self._rerun(self._due(session, None), backfill=True)
+            self._decide()
+
+    def _due(self, session: pytest.Session, look: Optional[int]) -> List[pytest.Item]:
+        "Items to run at *look*, or (look=None) every item with a p-value yet."
+        out = []
+        for item in session.items:
+            state = self._state.get(item.nodeid)
+            if state is None or state.value is None:
+                continue
+            if look is not None and not (state.active and state.k_looks >= look):
+                continue
+            out.append(item)
+        return out
+
+    def _rerun(self, items: List[pytest.Item], backfill: bool = False) -> None:
+        from _pytest.runner import runtestprotocol
+
+        self._backfill = backfill
+        try:
+            for i, item in enumerate(items):
+                nextitem = items[i + 1] if i + 1 < len(items) else None
+                # log=False: these reports never reach the terminal, so pytest's
+                # own counts stay put and the verdict is applied to the look-1
+                # report in pytest_terminal_summary as before.
+                for report in runtestprotocol(item, nextitem=nextitem, log=False):
+                    if report.failed:
+                        # Log this one after all, so it gets the ordinary
+                        # traceback and failure section.  Its stale look-1
+                        # "passed" report is dropped in the terminal summary.
+                        self._errors[item.nodeid] = report.longrepr
+                        self._state[item.nodeid].active = False
+                        item.ihook.pytest_runtest_logreport(report=report)
+                        break
+        finally:
+            self._backfill = False
+
+    def _stop_for_maxfail(self, session: pytest.Session) -> bool:
+        "Honour -x / --maxfail, which pytest cannot see through unlogged reruns."
+        maxfail = session.config.getvalue("maxfail")
+        if not maxfail:
+            return False
+        rejected = sum(
+            1 for st in self._state.values()
+            if st.adjusted is not None and st.adjusted <= self.alpha
         )
+        if rejected + len(self._errors) >= maxfail:
+            session.shouldstop = "maxfail reached during group-sequential looks"
+            return True
+        return False
 
-        for (nodeid, p, _), adj in zip(sorted_items, adjusted):
+    def _decide(self) -> List[tuple]:
+        "Apply the correction to every test with a p-value; deactivate rejected."
+        # A test that raised on a later look never completed, so — like one that
+        # raises before assertNotReject — it is not a member of the family.
+        values = [
+            (st.value, nodeid, st) for nodeid, st in self._state.items()
+            if st.value is not None and nodeid not in self._errors
+        ]
+        if not values:
+            return []
+        values.sort(key=lambda triple: triple[0])
+        ready = [(nodeid, st) for _, nodeid, st in values]
+
+        if self.correction == "westfall-young" and not self._nulls_open:
+            # A Westfall-Young adjusted p-value is never below the raw one, so
+            # while every p* exceeds alpha nothing can be rejected and the
+            # resampling is wasted work.  Open the gate only when it could
+            # change a verdict, then rebuild the columns from look 1.
+            if values[0][0] > self.alpha:
+                return ready
+            self._nulls_open = True
+            self._need_backfill = True
+            return ready
+
+        adjusted = CORRECTIONS[self.correction](
+            [p for p, _, _ in values],
+            [st.nulls for _, _, st in values],
+        )
+        for (_, st), adj in zip(ready, adjusted):
             # Null hypothesis rejected — assertNotReject fails.  Monotonicity of
-            # the adjusted values makes this the step-down stop condition.
+            # the adjusted values makes this the step-down stop condition, and
+            # makes it safe to stop sampling this test now.
+            st.adjusted = adj
+            if adj <= self.alpha:
+                st.active = False
+        return ready
+
+    def _apply_correction(self) -> None:
+        for nodeid, state in self._decide():
+            rejected = state.adjusted is not None and state.adjusted <= self.alpha
             self._corrected.append(_CorrectedResult(
                 nodeid=nodeid,
-                p_value=p,
-                adjusted=adj,
-                passed=adj > self.alpha,
+                p_value=state.value,
+                adjusted=state.adjusted,
+                passed=not rejected and nodeid not in self._errors,
+                looks=state.looks_done,
+                k_looks=state.k_looks,
             ))
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
@@ -270,7 +661,7 @@ class FamilywisePlugin:
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
     def pytest_terminal_summary(self, terminalreporter, exitstatus: int, config: pytest.Config) -> None:
-        if not self._corrected:
+        if not self._corrected and not self._errors:
             return
 
         stats = terminalreporter.stats
@@ -281,31 +672,55 @@ class FamilywisePlugin:
         # stats['passed'] holds exactly the call-phase passed reports (pytest
         # files passed setup/teardown under ''), which is the set we may move.
         failed = {r.nodeid: r for r in self._corrected if not r.passed}
-        passed_list = stats.get("passed", [])
-        for report in [r for r in passed_list if r.nodeid in failed]:
-            result = failed[report.nodeid]
-            passed_list.remove(report)
-            report.outcome = "failed"
-            report.longrepr = (
+        messages = {
+            nodeid: (
                 f"{label}: p={result.p_value:.6f}, "
                 f"adjusted p={result.adjusted:.6f}"
                 f" <= α={self.alpha} (null hypothesis rejected)"
             )
+            for nodeid, result in failed.items()
+            if result.adjusted is not None
+        }
+
+        passed_list = stats.get("passed", [])
+        for report in [r for r in passed_list if r.nodeid in messages]:
+            passed_list.remove(report)
+            report.outcome = "failed"
+            report.longrepr = messages[report.nodeid]
             stats.setdefault("failed", []).append(report)
+        # Tests that raised on a later look already logged a real failure
+        # report; drop the stale look-1 "passed" one so they are not counted
+        # twice.
+        for report in [r for r in passed_list if r.nodeid in self._errors]:
+            passed_list.remove(report)
+
+        if not self._corrected:
+            return  # every test errored out; nothing was corrected
 
         n_total = len(self._corrected)
         n_failed = len(failed)
         n_passed = n_total - n_failed
 
+        sequential = f"  groupsize={self.groupsize}" if self.groupsize > 0 else ""
         terminalreporter.write_sep(
             "=",
-            f"{label} correction  α={self.alpha}  n={n_total}",
+            f"{label} correction  α={self.alpha}  n={n_total}{sequential}",
         )
         for result in self._corrected:  # already sorted by p-value
             status = "PASSED" if result.passed else "FAILED"
+            # Only tests whose p* could not have been rejected skip resampling,
+            # so there is no adjusted value to show for them.
+            adjusted = (
+                f"adjusted p={result.adjusted:.6f}"
+                if result.adjusted is not None else "adjusted p>α"
+            )
+            looks = (
+                f"  looks={result.looks}/{result.k_looks}"
+                if self.groupsize > 0 else ""
+            )
             terminalreporter.write_line(
                 f"  {status}  p={result.p_value:.6f}  "
-                f"adjusted p={result.adjusted:.6f}  {result.nodeid}"
+                f"{adjusted}{looks}  {result.nodeid}"
             )
         terminalreporter.write_line(
             f"\n  {n_passed} passed, {n_failed} failed "
@@ -350,14 +765,36 @@ def pytest_addoption(parser: pytest.Parser) -> None:
             "(default: 0.8).  This is per-test, not family-wise."
         ),
     )
+    parser.addoption(
+        "--groupsize",
+        type=int,
+        default=0,
+        metavar="N",
+        help=(
+            "Samples per group for group-sequential testing (default: 0, "
+            "disabled).  Tests draw one group at a time and stop as soon as "
+            "their null is rejected; the number of groups follows from the "
+            "sample-size fixtures.  Requires assertNotReject to be given a "
+            "sampler and the test to use a sample-size fixture."
+        ),
+    )
 
 
 def pytest_configure(config: pytest.Config) -> None:
+    groupsize = config.getoption("--groupsize")
+    if groupsize < 0:
+        raise pytest.UsageError("--groupsize must be >= 0")
+    if groupsize > 0 and config.getoption("dist", "no") != "no":
+        # Later looks re-run the test protocol from pytest_runtestloop, which
+        # xdist replaces outright.
+        raise pytest.UsageError("--groupsize is not supported under pytest-xdist")
+
     plugin = FamilywisePlugin(
         alpha=config.getoption("--alpha"),
         power=config.getoption("--power"),
         correction=config.getoption("--correction"),
         resamples=config.getoption("--resamples"),
+        groupsize=groupsize,
     )
     config.pluginmanager.register(plugin, "familywise-correction")
     config._familywise_plugin = plugin  # type: ignore[attr-defined]
@@ -367,17 +804,29 @@ def pytest_configure(config: pytest.Config) -> None:
 def assertNotReject(request: pytest.FixtureRequest) -> PValueReporter:
     """Assert that the null hypothesis is not rejected after FWER correction.
 
-    Call the returned object once inside your test with the computed p-value.
-    The test passes if the p-value is too large to reject H0; it fails if
-    H0 is rejected.
-
-    Example:
+    Call the returned object once inside your test with a **sampler**: a
+    callable that draws one group of data from the generator it is handed and
+    returns the p-value for that group.  The test passes if the null hypothesis
+    survives correction; it fails if H0 is rejected.
 
     ```python
-    def test_chi_squared(assertNotReject):
-        stat, p = scipy.stats.chisquare(observed, expected)
-        assertNotReject(p)
+    def test_mean_zero(ztest_sample_size, assertNotReject):
+        n = ztest_sample_size(effect_size=0.3)
+
+        def sample(rng):
+            return scipy.stats.ttest_1samp(rng.standard_normal(n), 0.0).pvalue
+
+        assertNotReject(sample)
     ```
+
+    Without ``--groupsize`` the sampler is called exactly once and its p-value
+    is used directly.  Under ``--groupsize`` it is called once per look, on
+    fresh data each time, until the null is rejected or the planned number of
+    groups is exhausted; the group p-values are combined into a single
+    sequential p-value against a Pocock boundary.  **Draw your data from the
+    ``rng`` argument.**  A sampler that reads its data from a module- or
+    session-scoped fixture would see the same observations at every look, and
+    the groups would not be independent.
 
     Under ``--correction=westfall-young`` a second argument is required: a
     callable that recomputes *this test's* p-value under H0.  It receives a
@@ -387,14 +836,15 @@ def assertNotReject(request: pytest.FixtureRequest) -> PValueReporter:
 
     ```python
     def test_mean_zero(assertNotReject, data):
-        _, p = scipy.stats.ttest_1samp(data, 0.0)
+        def sample(rng):
+            return scipy.stats.ttest_1samp(data, 0.0).pvalue
 
         def under_h0(rng):
             centered = data - data.mean()          # impose H0
             boot = rng.choice(centered, size=len(data))
             return scipy.stats.ttest_1samp(boot, 0.0)[1]
 
-        assertNotReject(p, null_sample=under_h0)
+        assertNotReject(sample, null_sample=under_h0)
     ```
 
     The ``rng`` for resample *b* is seeded identically in every test, so two
@@ -403,12 +853,7 @@ def assertNotReject(request: pytest.FixtureRequest) -> PValueReporter:
     their correlation.
     """
     plugin: FamilywisePlugin = request.config._familywise_plugin  # type: ignore[attr-defined]
-    reporter = PValueReporter(
-        needs_null=plugin.correction == "westfall-young",
-        resamples=plugin.resamples,
-    )
-    plugin._reporters[request.node.nodeid] = reporter
-    return reporter
+    return PValueReporter(plugin, request.node.nodeid)
 
 
 @pytest.fixture
@@ -440,7 +885,11 @@ def ztest_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     alpha = plugin.get_corrected_alpha(nodeid)
 
     def compute(effect_size: float, two_sided: bool = True) -> int:
-        return _ztest_n(alpha, plugin.power, effect_size, two_sided)
+        return plugin.plan(
+            nodeid,
+            lambda a, power: _ztest_n(a, power, effect_size, two_sided),
+            alpha,
+        )
 
     return compute
 
@@ -470,7 +919,11 @@ def chisquare_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     alpha = plugin.get_corrected_alpha(nodeid)
 
     def compute(effect_size: float, df: int) -> int:
-        return _chisquare_n(alpha, plugin.power, effect_size, df)
+        return plugin.plan(
+            nodeid,
+            lambda a, power: _chisquare_n(a, power, effect_size, df),
+            alpha,
+        )
 
     return compute
 
@@ -502,6 +955,10 @@ def ks_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     alpha = plugin.get_corrected_alpha(nodeid)
 
     def compute(effect_size: float, two_sample: bool = False) -> int:
-        return _ks_n(alpha, plugin.power, effect_size, two_sample)
+        return plugin.plan(
+            nodeid,
+            lambda a, power: _ks_n(a, power, effect_size, two_sample),
+            alpha,
+        )
 
     return compute

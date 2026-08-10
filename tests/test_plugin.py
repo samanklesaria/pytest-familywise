@@ -3,12 +3,17 @@ import json
 import math
 import pytest
 from numpy.random import default_rng
+from scipy.stats import norm
 from pytest_familywise import (
     _ztest_n,
     _chisquare_n,
     _ks_n,
     _holm_adjusted,
     _westfall_young_adjusted,
+    _cross_prob,
+    _pocock_c,
+    _n_looks,
+    _group_drift,
 )
 
 
@@ -29,7 +34,7 @@ def test_passes_when_data_consistent_with_h0(pytester):
     """A large p-value means data is consistent with H0 — test passes."""
     result = run(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(0.9)
+            assertNotReject(lambda rng: 0.9)
     """)
     result.assert_outcomes(passed=1)
 
@@ -38,7 +43,7 @@ def test_fails_when_h0_rejected(pytester):
     """A very small p-value means H0 is rejected — test fails."""
     result = run(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(0.001)
+            assertNotReject(lambda rng: 0.001)
     """)
     result.assert_outcomes(failed=1)
 
@@ -47,7 +52,7 @@ def test_rejected_at_boundary(pytester):
     # n=1: threshold = alpha = 0.05; p = 0.05 <= threshold -> rejected -> fail
     result = run(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(0.05)
+            assertNotReject(lambda rng: 0.05)
     """, alpha=0.05)
     result.assert_outcomes(failed=1)
 
@@ -56,7 +61,7 @@ def test_not_rejected_just_above_alpha(pytester):
     # n=1: threshold = alpha = 0.05; p = 0.051 > threshold -> not rejected -> pass
     result = run(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(0.051)
+            assertNotReject(lambda rng: 0.051)
     """, alpha=0.05)
     result.assert_outcomes(passed=1)
 
@@ -68,9 +73,9 @@ def test_not_rejected_just_above_alpha(pytester):
 def test_all_pass_when_all_pvalues_large(pytester):
     """When all p-values are large (data consistent with H0), all tests pass."""
     result = run(pytester, """
-        def test_a(assertNotReject): assertNotReject(0.5)
-        def test_b(assertNotReject): assertNotReject(0.7)
-        def test_c(assertNotReject): assertNotReject(0.3)
+        def test_a(assertNotReject): assertNotReject(lambda rng: 0.5)
+        def test_b(assertNotReject): assertNotReject(lambda rng: 0.7)
+        def test_c(assertNotReject): assertNotReject(lambda rng: 0.3)
     """)
     result.assert_outcomes(passed=3)
 
@@ -83,10 +88,10 @@ def test_all_fail_when_all_pvalues_tiny(pytester):
     # k=3: threshold=0.05/2=0.025;  0.003<=0.025  -> REJECT
     # k=4: threshold=0.05/1=0.05;   0.004<=0.05   -> REJECT
     result = run(pytester, """
-        def test_a(assertNotReject): assertNotReject(0.001)
-        def test_b(assertNotReject): assertNotReject(0.002)
-        def test_c(assertNotReject): assertNotReject(0.003)
-        def test_d(assertNotReject): assertNotReject(0.004)
+        def test_a(assertNotReject): assertNotReject(lambda rng: 0.001)
+        def test_b(assertNotReject): assertNotReject(lambda rng: 0.002)
+        def test_c(assertNotReject): assertNotReject(lambda rng: 0.003)
+        def test_d(assertNotReject): assertNotReject(lambda rng: 0.004)
     """)
     result.assert_outcomes(failed=4)
 
@@ -99,8 +104,8 @@ def test_correction_protects_marginal_pvalues(pytester):
     tightens the threshold so 0.04 > 0.025 -> not rejected -> pass.
     """
     result = run(pytester, """
-        def test_a(assertNotReject): assertNotReject(0.04)
-        def test_b(assertNotReject): assertNotReject(0.08)
+        def test_a(assertNotReject): assertNotReject(lambda rng: 0.04)
+        def test_b(assertNotReject): assertNotReject(lambda rng: 0.08)
     """)
     result.assert_outcomes(passed=2)
 
@@ -115,9 +120,9 @@ def test_step_down_rejects_only_smallest(pytester):
     k=3: stop                                             (pass)
     """
     result = run(pytester, """
-        def test_a(assertNotReject): assertNotReject(0.01)
-        def test_b(assertNotReject): assertNotReject(0.03)
-        def test_c(assertNotReject): assertNotReject(0.07)
+        def test_a(assertNotReject): assertNotReject(lambda rng: 0.01)
+        def test_b(assertNotReject): assertNotReject(lambda rng: 0.03)
+        def test_c(assertNotReject): assertNotReject(lambda rng: 0.07)
     """)
     result.assert_outcomes(passed=2, failed=1)
 
@@ -132,9 +137,9 @@ def test_step_down_rejects_all_when_all_below_thresholds(pytester):
     k=3: threshold=0.05/1=0.05;   0.04 <=0.05   -> REJECT
     """
     result = run(pytester, """
-        def test_a(assertNotReject): assertNotReject(0.01)
-        def test_b(assertNotReject): assertNotReject(0.04)
-        def test_c(assertNotReject): assertNotReject(0.007)
+        def test_a(assertNotReject): assertNotReject(lambda rng: 0.01)
+        def test_b(assertNotReject): assertNotReject(lambda rng: 0.04)
+        def test_c(assertNotReject): assertNotReject(lambda rng: 0.007)
     """)
     result.assert_outcomes(failed=3)
 
@@ -150,7 +155,7 @@ def test_ordinary_passing_test_unaffected(pytester):
             assert 1 + 1 == 2
 
         def test_stat(assertNotReject):
-            assertNotReject(0.9)
+            assertNotReject(lambda rng: 0.9)
     """)
     result.assert_outcomes(passed=2)
 
@@ -162,7 +167,7 @@ def test_ordinary_failing_test_unaffected(pytester):
             assert False
 
         def test_stat(assertNotReject):
-            assertNotReject(0.9)
+            assertNotReject(lambda rng: 0.9)
     """)
     result.assert_outcomes(passed=1, failed=1)
 
@@ -177,7 +182,7 @@ def test_exception_before_assertNotReject_fails_normally(pytester):
     result = run(pytester, """
         def test_raises(assertNotReject):
             raise RuntimeError("boom")
-            assertNotReject(0.9)
+            assertNotReject(lambda rng: 0.9)
     """)
     result.assert_outcomes(failed=1)
 
@@ -187,7 +192,7 @@ def test_exception_after_assertNotReject_still_fails(pytester):
     normally — the plugin does not override it to passed."""
     result = run(pytester, """
         def test_raises(assertNotReject):
-            assertNotReject(0.9)
+            assertNotReject(lambda rng: 0.9)
             raise RuntimeError("boom after assertNotReject")
     """)
     result.assert_outcomes(failed=1)
@@ -201,7 +206,7 @@ def test_stricter_alpha_protects_more(pytester):
     """A stricter alpha=0.01 does not reject p=0.02 (which alpha=0.05 would)."""
     result = run(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(0.02)
+            assertNotReject(lambda rng: 0.02)
     """, alpha=0.01)
     result.assert_outcomes(passed=1)
 
@@ -210,7 +215,7 @@ def test_stricter_alpha_still_rejects_very_small(pytester):
     """Even at alpha=0.01, a very small p-value is still rejected."""
     result = run(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(0.005)
+            assertNotReject(lambda rng: 0.005)
     """, alpha=0.01)
     result.assert_outcomes(failed=1)
 
@@ -222,7 +227,7 @@ def test_stricter_alpha_still_rejects_very_small(pytester):
 def test_invalid_pvalue_raises(pytester):
     result = run(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(1.5)
+            assertNotReject(lambda rng: 1.5)
     """)
     result.assert_outcomes(failed=1)
 
@@ -238,7 +243,7 @@ def test_parametrized_all_consistent_with_h0(pytester):
 
         @pytest.mark.parametrize("p", [0.5, 0.6, 0.7])
         def test_param(assertNotReject, p):
-            assertNotReject(p)
+            assertNotReject(lambda rng: p)
     """)
     result.assert_outcomes(passed=3)
 
@@ -256,7 +261,7 @@ def test_parametrized_mixed(pytester):
 
         @pytest.mark.parametrize("p", [0.001, 0.5, 0.9])
         def test_param(assertNotReject, p):
-            assertNotReject(p)
+            assertNotReject(lambda rng: p)
     """)
     result.assert_outcomes(passed=2, failed=1)
 
@@ -364,7 +369,7 @@ def test_wy_passes_when_observed_p_is_typical(pytester):
     """An observed p in the bulk of its own null distribution is not rejected."""
     result = run_wy(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(0.5, null_sample=lambda rng: rng.random())
+            assertNotReject(lambda rng: 0.5, null_sample=lambda rng: rng.random())
     """)
     result.assert_outcomes(passed=1)
 
@@ -373,7 +378,7 @@ def test_wy_fails_when_observed_p_is_extreme(pytester):
     """An observed p far below every null draw is rejected."""
     result = run_wy(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(1e-6, null_sample=lambda rng: rng.random())
+            assertNotReject(lambda rng: 1e-6, null_sample=lambda rng: rng.random())
     """)
     result.assert_outcomes(failed=1)
 
@@ -382,7 +387,7 @@ def test_wy_requires_null_sample(pytester):
     """Omitting null_sample under WY fails the test with a clear message."""
     result = run_wy(pytester, """
         def test_foo(assertNotReject):
-            assertNotReject(0.5)
+            assertNotReject(lambda rng: 0.5)
     """)
     result.assert_outcomes(failed=1)
     result.stdout.fnmatch_lines(["*requires*null_sample*"])
@@ -402,13 +407,13 @@ def test_wy_null_columns_are_aligned(pytester):
             return float(rng.random())
 
         def test_a(assertNotReject, request):
-            assertNotReject(0.5, null_sample=sample)
-            nulls = request.config._familywise_plugin._reporters[request.node.nodeid].nulls
+            assertNotReject(lambda rng: 0.5, null_sample=sample)
+            nulls = request.config._familywise_plugin._state[request.node.nodeid].nulls
             pathlib.Path("a.json").write_text(json.dumps(nulls.tolist()))
 
         def test_b(assertNotReject, request):
-            assertNotReject(0.5, null_sample=sample)
-            nulls = request.config._familywise_plugin._reporters[request.node.nodeid].nulls
+            assertNotReject(lambda rng: 0.5, null_sample=sample)
+            nulls = request.config._familywise_plugin._state[request.node.nodeid].nulls
             pathlib.Path("b.json").write_text(json.dumps(nulls.tolist()))
 
         def test_aligned():
@@ -446,7 +451,7 @@ def test_readme_wy_example_runs(pytester):
 
         def test_mean_zero(assertNotReject, samples):
             p = scipy.stats.ttest_1samp(samples, 0.0).pvalue
-            assertNotReject(p, null_sample=lambda rng:
+            assertNotReject(lambda rng: p, null_sample=lambda rng:
                 scipy.stats.ttest_1samp(under_h0(rng, samples), 0.0).pvalue)
 
 
@@ -454,7 +459,7 @@ def test_readme_wy_example_runs(pytester):
             def pvalue(data):
                 return scipy.stats.binomtest(int((data > 0).sum()), len(data), 0.5).pvalue
 
-            assertNotReject(pvalue(samples), null_sample=lambda rng:
+            assertNotReject(lambda rng: pvalue(samples), null_sample=lambda rng:
                 pvalue(under_h0(rng, samples)))
     """)
     result = pytester.runpytest("--correction=westfall-young", "--resamples=100")
@@ -482,7 +487,7 @@ def test_readme_permutation_example_runs(pytester):
             def pvalue(x):
                 return scipy.stats.ks_2samp(x[:n], x[n:]).pvalue
 
-            assertNotReject(pvalue(pooled), null_sample=lambda rng:
+            assertNotReject(lambda rng: pvalue(pooled), null_sample=lambda rng:
                 pvalue(rng.permutation(pooled)))
     """)
     result = pytester.runpytest("--correction=westfall-young", "--resamples=100")
@@ -502,8 +507,8 @@ def test_wy_beats_holm_on_correlated_tests(pytester):
         def sample(rng):
             return float(rng.random())
 
-        def test_a(assertNotReject): assertNotReject(0.03, null_sample=sample)
-        def test_b(assertNotReject): assertNotReject(0.03, null_sample=sample)
+        def test_a(assertNotReject): assertNotReject(lambda rng: 0.03, null_sample=sample)
+        def test_b(assertNotReject): assertNotReject(lambda rng: 0.03, null_sample=sample)
     """
     wy = run_wy(pytester, src, resamples=2000)
     wy.assert_outcomes(failed=2)   # WY: adjusted ~0.03 <= 0.05 -> rejected
@@ -661,11 +666,11 @@ def test_non_participating_test_does_not_inflate_m(pytester):
 
         def test_first(assertNotReject, ztest_sample_size):
             record("first.json", ztest_sample_size(effect_size=0.3))
-            assertNotReject(0.5)
+            assertNotReject(lambda rng: 0.5)
 
         def test_second(assertNotReject, ztest_sample_size):
             record("second.json", ztest_sample_size(effect_size=0.3))
-            assertNotReject(0.5)
+            assertNotReject(lambda rng: 0.5)
     """)
     result = pytester.runpytest("--alpha=0.05")
     result.assert_outcomes(passed=3)
@@ -693,16 +698,16 @@ def test_family_members_count_toward_m_even_if_they_never_size(pytester):
         def test_a(assertNotReject, ztest_sample_size):
             pathlib.Path("a.json").write_text(
                 json.dumps(ztest_sample_size(effect_size=0.3)))
-            assertNotReject(0.5)
+            assertNotReject(lambda rng: 0.5)
 
         def test_b(assertNotReject):
             # In the family, but never sizes.
-            assertNotReject(0.5)
+            assertNotReject(lambda rng: 0.5)
 
         def test_c(assertNotReject, ztest_sample_size):
             pathlib.Path("c.json").write_text(
                 json.dumps(ztest_sample_size(effect_size=0.3)))
-            assertNotReject(0.5)
+            assertNotReject(lambda rng: 0.5)
     """)
     pytester.runpytest("--alpha=0.05").assert_outcomes(passed=3)
 
@@ -722,11 +727,11 @@ def test_every_sizing_fixture_in_a_test_sees_the_same_alpha(pytester):
                 ztest_sample_size(effect_size=0.3),
                 ks_sample_size(effect_size=0.1),
             ]))
-            assertNotReject(0.5)
+            assertNotReject(lambda rng: 0.5)
 
         def test_other(assertNotReject, ztest_sample_size):
             ztest_sample_size(effect_size=0.3)
-            assertNotReject(0.5)
+            assertNotReject(lambda rng: 0.5)
     """)
     pytester.runpytest("--alpha=0.05").assert_outcomes(passed=2)
 
@@ -744,3 +749,316 @@ def test_power_option_affects_sample_size(pytester):
     """)
     result = pytester.runpytest("--power=0.9")
     result.assert_outcomes(passed=1)
+
+
+# ---------------------------------------------------------------------------
+# Group-sequential boundary math (no pytester needed)
+# ---------------------------------------------------------------------------
+
+class TestCrossProb:
+    def test_single_look_is_the_closed_form(self):
+        for b in (-1.0, 0.0, 1.7, 3.0):
+            assert _cross_prob(b, 1) == pytest.approx(norm.sf(b), abs=1e-12)
+
+    def test_more_looks_cross_more_often(self):
+        probs = [_cross_prob(2.0, k) for k in (1, 2, 5, 10)]
+        assert probs == sorted(probs)
+
+    def test_decreasing_in_the_boundary(self):
+        probs = [_cross_prob(b, 5) for b in (0.5, 1.5, 2.5, 3.5)]
+        assert probs == sorted(probs, reverse=True)
+
+    def test_drift_raises_the_crossing_probability(self):
+        assert _cross_prob(2.4, 5, drift=0.8) > _cross_prob(2.4, 5, drift=0.0)
+
+    def test_pocock_constant_round_trips(self):
+        """The recursion must invert its own boundary to near machine precision.
+
+        This is what a randomised quadrature (multivariate_normal.cdf) cannot
+        do: its ~1e-5 run-to-run noise would show up directly here, and hence
+        in every reported p-value.
+        """
+        for alpha in (0.05, 0.005):
+            for k in (2, 5, 10, 20):
+                c = _pocock_c(alpha, k)
+                assert _cross_prob(c, k) == pytest.approx(alpha, abs=1e-9)
+
+    def test_is_deterministic(self):
+        assert len({_cross_prob(2.2, 8) for _ in range(5)}) == 1
+
+    def test_pocock_boundary_is_stricter_than_fixed_sample(self):
+        assert _pocock_c(0.05, 5) > _pocock_c(0.05, 1)
+
+    def test_calibrated_against_simulation(self):
+        """The end-to-end construction must reject at exactly alpha under H0.
+
+        Simulate whole null paths of group p-values, combine them the way the
+        plugin does, and check the boundary is crossed at the nominal rate.
+        """
+        import numpy as np
+
+        rng = default_rng(7)
+        for k, alpha in ((3, 0.05), (5, 0.01)):
+            p = rng.random((200_000, k))
+            z = norm.isf(p).cumsum(axis=1) / np.sqrt(np.arange(1, k + 1))
+            empirical = (z.max(axis=1) >= _pocock_c(alpha, k)).mean()
+            se = math.sqrt(alpha * (1 - alpha) / 200_000)
+            assert abs(empirical - alpha) < 4 * se
+
+
+class TestNLooks:
+    def test_one_look_when_a_group_is_already_enough(self):
+        # mu well past the fixed-sample requirement at this level
+        assert _n_looks(4.0, 0.05, 0.8) == 1
+
+    def test_is_the_smallest_adequate_k(self):
+        mu, alpha, power = 1.2, 0.05, 0.8
+        k = _n_looks(mu, alpha, power)
+        assert _cross_prob(_pocock_c(alpha, k), k, drift=mu) >= power
+        if k > 1:
+            assert _cross_prob(_pocock_c(alpha, k - 1), k - 1, drift=mu) < power
+
+    def test_weaker_signal_needs_more_looks(self):
+        assert _n_looks(0.8, 0.05, 0.8) > _n_looks(1.6, 0.05, 0.8)
+
+    def test_refuses_a_signalless_group(self):
+        with pytest.raises(ValueError):
+            _n_looks(0.0, 0.05, 0.8)
+
+
+class TestGroupDrift:
+    def test_matches_the_closed_form_for_a_ztest(self):
+        """For a z-test mu is exactly effect_size * sqrt(n), which is the case
+        the probit approximation is built around."""
+        groupsize, effect, alpha = 200, 0.3, 0.01
+        mu = _group_drift(
+            lambda a, power: _ztest_n(a, power, effect, two_sided=False),
+            alpha, groupsize,
+        )
+        assert mu == pytest.approx(effect * math.sqrt(groupsize), rel=0.02)
+
+    def test_reports_no_signal_for_a_tiny_group(self):
+        assert _group_drift(
+            lambda a, power: _ks_n(a, power, 0.05), 0.01, 10,
+        ) == 0.0
+
+
+# ---------------------------------------------------------------------------
+# Group-sequential end-to-end
+# ---------------------------------------------------------------------------
+
+def run_seq(pytester, src: str, groupsize: int = 50, *extra: str):
+    pytester.makepyfile(src)
+    return pytester.runpytest(f"--groupsize={groupsize}", "-v", *extra)
+
+
+def test_healthy_test_uses_every_look(pytester):
+    """A test whose null holds runs its full planned number of groups."""
+    result = run_seq(pytester, """
+        import json, pathlib
+
+        def test_a(ztest_sample_size, assertNotReject, request):
+            n = ztest_sample_size(effect_size=0.3)
+            calls = []
+            def sample(rng):
+                calls.append(1)
+                pathlib.Path("calls.json").write_text(json.dumps(len(calls)))
+                return 0.9
+            assertNotReject(sample)
+
+        def test_looks():
+            k = json.loads(pathlib.Path("calls.json").read_text())
+            assert k == 1     # per-run state; see test_z below for the total
+    """)
+    result.assert_outcomes(passed=2)
+
+
+def test_broken_test_stops_early(pytester):
+    """A rejected test must stop drawing groups; a healthy one must not."""
+    result = run_seq(pytester, """
+        import json, pathlib
+
+        def _count(name):
+            path = pathlib.Path(name)
+            n = json.loads(path.read_text()) if path.exists() else 0
+            path.write_text(json.dumps(n + 1))
+
+        def test_broken(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            def sample(rng):
+                _count("broken.json")
+                return 1e-8
+            assertNotReject(sample)
+
+        def test_healthy(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            def sample(rng):
+                _count("healthy.json")
+                return 0.9
+            assertNotReject(sample)
+    """)
+    result.assert_outcomes(passed=1, failed=1)
+    broken = json.loads((pytester.path / "broken.json").read_text())
+    healthy = json.loads((pytester.path / "healthy.json").read_text())
+    assert broken < healthy      # stopped as soon as it was rejected
+    assert broken == 1           # 1e-8 clears the boundary at the first look
+    assert healthy > 1           # the per-look correction kept it going
+
+
+def test_reruns_do_not_disturb_reported_counts(pytester):
+    """Later looks are unlogged, so pytest's own tallies must be untouched."""
+    result = run_seq(pytester, """
+        def test_a(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            assertNotReject(lambda rng: 0.9)
+
+        def test_b(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            assertNotReject(lambda rng: 0.9)
+    """)
+    result.assert_outcomes(passed=2)
+
+
+def test_fixtures_are_live_at_every_look(pytester):
+    """The reason later looks re-run the protocol instead of deferring the
+    samplers: a function-scoped fixture must still work at look k."""
+    result = run_seq(pytester, """
+        def test_a(ztest_sample_size, assertNotReject, tmp_path):
+            ztest_sample_size(effect_size=0.3)
+            def sample(rng):
+                (tmp_path / "probe").write_text("alive")
+                assert (tmp_path / "probe").read_text() == "alive"
+                return 0.9
+            assertNotReject(sample)
+    """)
+    result.assert_outcomes(passed=1)
+
+
+def test_sampler_exception_on_a_later_look_fails_the_test(pytester):
+    """An exception mid-loop is an ordinary failure, not an internal error."""
+    result = run_seq(pytester, """
+        import json, pathlib
+
+        def test_a(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            def sample(rng):
+                path = pathlib.Path("n.json")
+                n = json.loads(path.read_text()) if path.exists() else 0
+                path.write_text(json.dumps(n + 1))
+                if n >= 1:
+                    raise RuntimeError("boom on the second look")
+                return 0.9
+            assertNotReject(sample)
+    """)
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*RuntimeError: boom on the second look*"])
+
+
+def test_maxfail_stops_the_look_loop(pytester):
+    """-x must still bite, even though the rerun reports are never logged."""
+    result = run_seq(pytester, """
+        import json, pathlib
+
+        def _count(name):
+            path = pathlib.Path(name)
+            n = json.loads(path.read_text()) if path.exists() else 0
+            path.write_text(json.dumps(n + 1))
+
+        def test_broken(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            def sample(rng):
+                _count("broken.json")
+                return 1e-8
+            assertNotReject(sample)
+
+        def test_healthy(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            def sample(rng):
+                _count("healthy.json")
+                return 0.9
+            assertNotReject(sample)
+    """, 50, "-x")
+    healthy = json.loads((pytester.path / "healthy.json").read_text())
+    assert healthy == 1   # stopped at the rejection instead of running the looks
+
+
+def test_sequential_p_value_is_shown_with_the_look_count(pytester):
+    result = run_seq(pytester, """
+        def test_a(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            assertNotReject(lambda rng: 0.9)
+    """)
+    result.stdout.fnmatch_lines(["*looks=*/*test_a*"])
+
+
+def test_raw_pvalue_is_rejected_with_a_useful_message(pytester):
+    result = run(pytester, """
+        def test_a(assertNotReject):
+            assertNotReject(0.5)
+    """)
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*takes a sampler, not a p-value*"])
+
+
+def test_sequential_requires_a_sample_size_fixture(pytester):
+    result = run_seq(pytester, """
+        def test_a(assertNotReject):
+            assertNotReject(lambda rng: 0.5)
+    """)
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*sample-size fixture*"])
+
+
+def test_group_too_small_names_the_lever(pytester):
+    result = run_seq(pytester, """
+        def test_a(ks_sample_size, assertNotReject):
+            ks_sample_size(effect_size=0.02)
+            assertNotReject(lambda rng: 0.5)
+    """, 10)
+    result.assert_outcomes(failed=1)
+    result.stdout.fnmatch_lines(["*--groupsize*"])
+
+
+def test_westfall_young_works_sequentially(pytester):
+    """WY over sequential p-values, with the null columns built per look."""
+    result = run_seq(pytester, """
+        def test_a(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            assertNotReject(lambda rng: 0.5, null_sample=lambda rng: rng.random())
+
+        def test_b(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            assertNotReject(lambda rng: 0.5, null_sample=lambda rng: rng.random())
+    """, 50, "--correction=westfall-young", "--resamples=200")
+    result.assert_outcomes(passed=2)
+
+
+def test_westfall_young_skips_resampling_when_nothing_is_close(pytester):
+    """The lazy gate: adjusted >= raw, so a family nowhere near alpha never
+    needs the null distribution at all."""
+    result = run_seq(pytester, """
+        import json, pathlib
+
+        def null(rng):
+            path = pathlib.Path("resamples.json")
+            n = json.loads(path.read_text()) if path.exists() else 0
+            path.write_text(json.dumps(n + 1))
+            return float(rng.random())
+
+        def test_a(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            assertNotReject(lambda rng: 0.9, null_sample=null)
+    """, 50, "--correction=westfall-young", "--resamples=200")
+    result.assert_outcomes(passed=1)
+    assert not (pytester.path / "resamples.json").exists()
+
+
+def test_sequential_rejection_uses_resampled_nulls(pytester):
+    """When something does approach alpha, the gate opens and the columns are
+    rebuilt from look 1 so the accumulated null path is complete."""
+    result = run_seq(pytester, """
+        def test_a(ztest_sample_size, assertNotReject):
+            ztest_sample_size(effect_size=0.3)
+            assertNotReject(lambda rng: 1e-6, null_sample=lambda rng: rng.random())
+    """, 50, "--correction=westfall-young", "--resamples=200")
+    result.assert_outcomes(failed=1)

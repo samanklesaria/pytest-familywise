@@ -54,33 +54,41 @@ test file without any import or `conftest.py` change.
 
 ## Quick example
 
+You hand `assertNotReject` a **sampler**: a callable that draws a group of data
+from the generator it is given and returns the p-value for that group.
+
 ```python
-import numpy as np
 import scipy.stats
 
 def test_uniform_marginals(ks_sample_size, assertNotReject):
     """Each output coordinate of our RNG should be marginally uniform."""
     n = ks_sample_size(effect_size=0.05)   # detect CDF deviation >= 5 pp
-    samples = np.random.rand(n)
-    result = scipy.stats.kstest(samples, "uniform")
-    assertNotReject(result.pvalue)
+    assertNotReject(lambda rng: scipy.stats.kstest(rng.random(n), "uniform").pvalue)
 
 
 def test_normal_mean_zero(ztest_sample_size, assertNotReject):
     """Standardised output should have mean zero"""
     n = ztest_sample_size(effect_size=0.3)   # Cohen's d = 0.3
-    samples = np.random.randn(n)
-    _, p = scipy.stats.ttest_1samp(samples, 0.0)
-    assertNotReject(p)
+
+    def sample(rng):
+        return scipy.stats.ttest_1samp(rng.standard_normal(n), 0.0).pvalue
+
+    assertNotReject(sample)
 
 
 def test_discrete_distribution(chisquare_sample_size, assertNotReject):
     """A categorical sampler should match its target probabilities."""
     n = chisquare_sample_size(effect_size=0.2, df=4)   # Cohen's w = 0.2
-    observed = np.random.multinomial(n, [0.2] * 5)
-    _, p = scipy.stats.chisquare(observed)
-    assertNotReject(p)
+
+    def sample(rng):
+        return scipy.stats.chisquare(rng.multinomial(n, [0.2] * 5)).pvalue
+
+    assertNotReject(sample)
 ```
+
+Ordinarily the sampler is called exactly once.  Under `--groupsize` it is
+called once per group, which is what makes [group-sequential
+testing](#group-sequential-testing) possible without rewriting your tests.
 
 Run with:
 
@@ -128,8 +136,9 @@ def under_h0(rng, data):
 
 
 def test_mean_zero(assertNotReject, samples):
-    p = scipy.stats.ttest_1samp(samples, 0.0).pvalue
-    assertNotReject(p, null_sample=lambda rng:
+    assertNotReject(
+        lambda rng: scipy.stats.ttest_1samp(samples, 0.0).pvalue,
+        null_sample=lambda rng:
         scipy.stats.ttest_1samp(under_h0(rng, samples), 0.0).pvalue)
 
 
@@ -138,8 +147,9 @@ def test_median_zero(assertNotReject, samples):
     def pvalue(data):
         return scipy.stats.binomtest(int((data > 0).sum()), len(data), 0.5).pvalue
 
-    assertNotReject(pvalue(samples), null_sample=lambda rng:
-        pvalue(under_h0(rng, samples)))
+    assertNotReject(
+        lambda rng: pvalue(samples),
+        null_sample=lambda rng: pvalue(under_h0(rng, samples)))
 ```
 
 Run with:
@@ -185,8 +195,9 @@ def test_groups_are_identical(assertNotReject, group_a, group_b):
     def pvalue(x):
         return scipy.stats.ks_2samp(x[:n], x[n:]).pvalue
 
-    assertNotReject(pvalue(pooled), null_sample=lambda rng:
-        pvalue(rng.permutation(pooled)))
+    assertNotReject(
+        lambda rng: pvalue(pooled),
+        null_sample=lambda rng: pvalue(rng.permutation(pooled)))
 ```
 
 Sign-flipping (`data * rng.choice([-1, 1], size=len(data))`) is the third common
@@ -210,6 +221,164 @@ Note that to estimate $P(c(S_L) \leq p_L)$ on Westfall-Young, we take samples of
 
 
 
+## Group-sequential testing
+
+Sizing every test for the effect you are worried about means a healthy suite
+draws its full sample every run, even though most tests would have been settled
+by a fraction of it — and a badly broken test pays the same price as a healthy
+one.  `--groupsize` makes the suite draw incrementally instead:
+
+```
+pytest --groupsize=40
+```
+
+Every test draws one group of 40, the plugin applies the step-down correction
+to the whole family, tests whose null is rejected stop, and the survivors draw
+another group.  The number of groups follows from the same sample-size planning
+as before.  Nothing in the tests changes — that is what the sampler contract
+buys:
+
+```
+============ Holm-Bonferroni correction  α=0.05  n=3  groupsize=40 =============
+  FAILED  p=0.000144  adjusted p=0.000433  looks=1/4  examples/group_sequential.py::test_biased_coin
+  PASSED  p=0.294538  adjusted p=0.589077  looks=4/4  examples/group_sequential.py::test_normal_mean_zero
+  PASSED  p=0.375008  adjusted p=0.589077  looks=2/2  examples/group_sequential.py::test_uniform_marginals
+
+  2 passed, 1 failed after Holm-Bonferroni correction
+```
+
+The broken test cost one group instead of four.  `looks=1/4` is the audit
+trail: how many groups were drawn, out of how many were planned.
+
+### Why the group p-values give an exact boundary
+
+Each look draws a *fresh, independent* group, and the sampler returns the
+p-value for that group alone.  So under $H_0$ the group p-values $p_1, \dotsc,
+p_K$ are independent and uniform.  Probit-transform and accumulate them:
+
+$$X_j = \Phi^{-1}(1 - p_j) \sim \mathcal{N}(0,1), \qquad S_k = \sum_{j \le k} X_j, \qquad Z_k = \frac{S_k}{\sqrt{k}}.$$
+
+Then $Z_k \sim \mathcal{N}(0,1)$ and, for $j \le k$,
+
+$$\operatorname{Cov}(Z_j, Z_k) = \frac{\operatorname{Var}(S_j)}{\sqrt{jk}} = \sqrt{j/k}.$$
+
+That is exactly the canonical joint distribution the group-sequential
+literature assumes — and here it holds *by construction*, for a KS test or a
+chi-square test or anything else, because the only inputs were independence of
+the groups and uniformity of a p-value.  No asymptotics, no assumption about
+the underlying statistic.  Applied directly to cumulative KS or chi-square
+statistics it would not hold, which is what usually makes exact
+group-sequential boundaries unavailable to a test-agnostic tool.
+
+(If a test's p-value is *super*-uniform — discrete statistics like `binomtest`
+— then $X_j$ is stochastically smaller than $\mathcal{N}(0,1)$ and everything
+below is conservative rather than exact.)
+
+### Pocock's boundary
+
+A group-sequential design rejects at the first look crossing a boundary
+$b_1, \dotsc, b_K$ chosen so that
+
+$$P_{H_0}\!\left(\exists\, k \le K : Z_k \ge b_k\right) = \alpha .$$
+
+One equation, $K$ unknowns — so a *shape* has to be fixed first.  The two
+classical ones are
+
+$$\textbf{Pocock: } b_k = c_K(\alpha)\ \text{(constant)} \qquad\qquad \textbf{O'Brien-Fleming: } b_k = c'_K(\alpha)/\sqrt{k} .$$
+
+Pocock spends $\alpha$ evenly, so the nominal per-look threshold is the same
+every look; it maximises the chance of stopping early at the cost of the
+largest maximum sample size.  O'Brien-Fleming is near-impossible to cross early
+and hoards $\alpha$ for the final look.  For a test suite, stopping early on a
+broken test is the entire point, so this plugin uses Pocock.
+
+$c_K$ grows slowly: at $\alpha = 0.05$ one-sided, the nominal per-look level
+falls from $0.05$ at $K=1$ to $0.0305$, $0.0233$ and $0.0169$ at $K = 2, 3, 5$.
+
+### One sequential p-value, then the usual correction
+
+Rather than compare $Z_k$ to $c_K$ at each look, the plugin inverts the
+boundary into a **sequential p-value**
+
+$$p^{*} = P_{H_0}\!\left(\max_{k \le K} Z_k \ \ge\ \max_{k \le L} Z_k\right)$$
+
+after $L$ looks.  Since $p^{*} \le \alpha \iff \max_k Z_k \ge c_K(\alpha)$ this
+is the Pocock rule exactly, but on the p-value scale — so Holm and
+Westfall-Young apply unchanged, and $p^{*}$ is what the summary reports.  Under
+$H_0$ at $L = K$ it is uniform, i.e. an honest p-value.  At $K = 1$ it is just
+$p_1$, which is why running without `--groupsize` behaves exactly as before.
+
+Crossing probabilities are computed by the Armitage–McPherson recursion on the
+sub-density $f_k$ of $S_k$ given that no earlier look crossed:
+
+$$f_1(s) = \varphi(s - \delta), \qquad f_{k+1}(s) = \int_{-\infty}^{\,b\sqrt{k}} f_k(u)\, \varphi(s - u - \delta)\, du,$$
+
+$$P_\delta\!\left(\exists\, k \le K : Z_k \ge b\right) = 1 - \int_{-\infty}^{\,b\sqrt{K}} f_K(s)\, ds .$$
+
+Independent increments turn a $K$-dimensional orthant probability into $K$
+one-dimensional convolutions.  With $\delta = 0$ this gives the boundary and
+the p-value; with $\delta = \mu$ it gives the design's power, so one routine
+serves all three.  It is used in preference to
+`scipy.stats.multivariate_normal.cdf` because that routine is randomised
+quasi-Monte-Carlo: it varies run to run by around $10^{-5}$ — enough to flip a
+borderline verdict between two runs on identical data — and it costs 0.5 s per
+call at $K=10$ against well under a millisecond here.
+
+### Why running the correction at every look is still valid
+
+$\max_{k \le L} Z_k$ is non-decreasing in $L$, so every $p^{*}$ is
+non-increasing across looks.  Holm's and Westfall-Young's adjusted p-values are
+coordinatewise non-decreasing in the p-value vector, so the adjusted values are
+non-increasing across looks too.  Therefore
+
+$$\{\text{test } i \text{ rejected at some look}\} = \{\text{test } i \text{ rejected at look } K\},$$
+
+and the whole procedure is equivalent to applying the correction *once*, at
+look $K$, to a vector of valid p-values.  The FWER proofs above carry over
+verbatim with $p^{*}$ in place of $p$; the monitoring needs no new argument.
+
+The same monotonicity licenses early stopping.  A test stopping at look $L < K$
+freezes $p^{*}$ at a value no smaller than its full-$K$ value, which can only
+*raise* other tests' adjusted p-values (conservative) and only *lower* its own,
+so it stays rejected.  Read a stopped test's reported $p^{*}$ as an upper
+bound — `looks=L/K` marks exactly which ones those are.
+
+### Planning the number of groups
+
+With per-group drift $\mu = \mathbb{E}[X_j]$ under the alternative, $Z_k$ has
+drift $\sqrt{k}\,\mu$, and $K$ is the smallest number of looks with
+
+$$P_{\mu}\!\left(\exists\, k \le K : Z_k \ge c_K(\alpha_i)\right) \ \ge\ 1 - \beta,$$
+
+at the same corrected level $\alpha_i = \alpha/m$ used everywhere else.  To get
+$\mu$ for a group of `--groupsize` samples, the sample-size functions are run
+backwards: find the power $\pi$ one group achieves at level $\alpha_i$, then
+$\mu = \Phi^{-1}(\pi) + \Phi^{-1}(1 - \alpha_i)$.  That identity is exact when
+the probit-transformed p-value is normal with unit variance (the z-test) and an
+approximation otherwise — it selects the number of looks, so a poor $\mu$ costs
+power, never error-rate control.
+
+### Costs
+
+- **Combining $K$ groups is weaker than pooling $K \times$ `groupsize`
+  samples** for KS and chi-square (for z/t-type tests it is equivalent).  If a
+  single group has no power to detect your effect at all, no number of groups
+  will, and the plugin says so and names `--groupsize` as the lever.
+- **The test body runs once per look.**  Later looks re-run the test protocol,
+  which is what keeps every sampler inside a live call phase with its fixtures
+  set up and its exceptions reported as ordinary failures.  Put expensive setup
+  in a module- or session-scoped fixture, which pytest reuses across the reruns.
+- **Draw your data from the `rng` argument**, not from a fixture.  A sampler
+  reading its data from a module-scoped fixture would see the same observations
+  at every look, and the groups would not be independent.  This is the one part
+  of the contract the plugin cannot check for you.
+- **Incompatible with `pytest-xdist`**, which replaces the same hook the look
+  loop needs.  Using both is an error rather than a silent single look.
+- Under `--correction=westfall-young`, null resampling is deferred until some
+  test's $p^{*}$ actually reaches $\alpha$ — an adjusted p-value is never below
+  the raw one, so until then no rejection is possible and the resampling cannot
+  change a verdict.  A suite that never comes close pays nothing.
+
 ## CLI options
 
 | Option | Default | Description |
@@ -218,6 +387,7 @@ Note that to estimate $P(c(S_L) \leq p_L)$ on Westfall-Young, we take samples of
 | `--correction` | `holm` | `holm` or `westfall-young` |
 | `--resamples` | `1000` | Null resamples per test (Westfall-Young only) |
 | `--power` | `0.8` | Per-test power used by the sample-size fixtures |
+| `--groupsize` | `0` | Samples per group for group-sequential testing; `0` disables |
 
 `--power` is per-test, not family-wise.  The sample-size fixtures use corrected
 significance levels rather than the raw alpha.  At collection time the plugin
@@ -263,16 +433,21 @@ Erring large costs samples, erring small costs the power you asked for.
 
 ```python
 def test_something(assertNotReject):
-    p = run_statistical_test()
-    assertNotReject(p)   # registers the p-value; plugin decides pass/fail
+    # fn(rng) draws one group of data and returns its p-value
+    assertNotReject(lambda rng: run_statistical_test(rng))
 ```
 
 The test passes if the null hypothesis is *not* rejected after correction (i.e.
 the p-value is large enough).  It fails if H0 is rejected.
 
-Calling `assertNotReject(p)` with a value outside [0, 1] raises `ValueError`.
-If a test raises an exception before `assertNotReject` is called, it fails
-normally and is excluded from the correction set.
+The argument is a **sampler**, not a p-value: a callable taking a numpy
+generator and returning a p-value.  Without `--groupsize` it is called exactly
+once; with it, once per group.  Passing a bare float raises `TypeError`.
+
+A sampler returning a value outside [0, 1] raises `ValueError`.  If a test
+raises an exception before `assertNotReject` is called — or from inside the
+sampler on any look — it fails normally and is excluded from the correction
+set.
 
 #### Under `--correction=westfall-young`
 
@@ -281,14 +456,15 @@ under H0.  It receives a seeded numpy generator.
 
 ```python
 def test_mean_zero(assertNotReject, data):
-    _, p = scipy.stats.ttest_1samp(data, 0.0)
+    def observed(rng):
+        return scipy.stats.ttest_1samp(data, 0.0).pvalue
 
     def under_h0(rng):
         centered = data - data.mean()            # impose H0 on the OBSERVED data
         boot = rng.choice(centered, size=len(data))
         return scipy.stats.ttest_1samp(boot, 0.0)[1]
 
-    assertNotReject(p, null_sample=under_h0)
+    assertNotReject(observed, null_sample=under_h0)
 ```
 
 **Transform the observed data; do not draw fresh data from a model.** Permute
