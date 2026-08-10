@@ -1,20 +1,14 @@
 """Tests for the familywise-correction pytest plugin."""
 import json
 import math
-import numpy as np
 import pytest
 from numpy.random import default_rng
 from pytest_familywise import (
-    CALIBRATION_VERSION,
     _ztest_n,
     _chisquare_n,
     _ks_n,
     _holm_adjusted,
     _westfall_young_adjusted,
-    _calibrated_alphas,
-    _conservative_quantile,
-    _Calibration,
-    _CalibrationError,
 )
 
 
@@ -351,417 +345,6 @@ class TestWestfallYoungAdjusted:
         assert _westfall_young_adjusted([1e-9], nulls)[0] == pytest.approx(0.1)
 
 
-# ---------------------------------------------------------------------------
-# Calibration: critical value from a recorded null matrix
-# ---------------------------------------------------------------------------
-
-def make_calibration(columns, resamples=None):
-    """Build a _Calibration from {nodeid: sequence of null p-values}."""
-    b = resamples if resamples is not None else len(next(iter(columns.values())))
-    return _Calibration(
-        resamples=b,
-        columns={k: np.asarray(v, dtype=np.float32) for k, v in columns.items()},
-    )
-
-
-class TestCalibratedAlpha:
-    def test_perfect_correlation_approaches_alpha(self):
-        """Identical columns => one effective test => c_1 approaches alpha.
-
-        This is the payoff: Holm would use alpha/m = 0.01 at rung 1 here.
-        """
-        grid = [i / 20000 for i in range(20000)]
-        cal = make_calibration({f"t{j}": grid for j in range(5)})
-        c = _calibrated_alphas(cal, [f"t{j}" for j in range(5)], 0.05)
-        assert 0.045 < c[0] <= 0.05
-        assert c[0] > 0.05 / 5 * 4  # far looser than Holm's alpha/m
-
-    def test_independence_lands_near_bonferroni(self):
-        """Independent columns => c_1 barely above alpha/m.
-
-        The feature correctly finding nothing is as important as it finding
-        something: this is the regime where calibration should not help.
-        """
-        rng = default_rng(0)
-        b = 40000
-        cal = make_calibration({f"t{j}": rng.random(b).tolist() for j in range(2)})
-        c = _calibrated_alphas(cal, ["t0", "t1"], 0.05)
-        # exact value is 1 - sqrt(0.95) = 0.02532, vs Bonferroni's 0.025
-        assert c[0] == pytest.approx(0.0253, abs=0.0015)
-
-    def test_ladder_brackets_holm_rung_by_rung(self):
-        """c_k >= alpha / (m - k + 1) for every k, so n only ever shrinks.
-
-        This is the property that lets the recording run size with Holm's ladder
-        instead of paying uniform alpha/m: each rung is loosened against the
-        matching rung, never against a collapsed single value.
-        """
-        rng = default_rng(1)
-        alpha = 0.05
-        for m in (2, 5, 20):
-            cal = make_calibration({f"t{j}": rng.random(4000).tolist() for j in range(m)})
-            c = _calibrated_alphas(cal, [f"t{j}" for j in range(m)], alpha)
-            assert len(c) == m
-            for k in range(1, m + 1):
-                assert alpha / (m - k + 1) <= c[k - 1] <= alpha
-
-    def test_ladder_is_monotone(self):
-        """A minimum over a superset is never larger, so c_k increases in k.
-
-        Later tests therefore get looser thresholds and smaller samples, which is
-        what makes ordering expensive tests last pay off.
-        """
-        rng = default_rng(7)
-        cols = {f"t{j}": (rng.random(8000) ** (1 + j)).tolist() for j in range(6)}
-        c = _calibrated_alphas(make_calibration(cols), sorted(cols), 0.05)
-        assert c == sorted(c)
-        assert c[-1] == pytest.approx(0.05)  # top rung: one column, quantile = alpha
-
-    def test_never_looser_than_alpha(self):
-        """c_k <= alpha always — no correction can beat doing no correction."""
-        cal = make_calibration({f"t{j}": [0.99] * 4000 for j in range(3)})
-        assert _calibrated_alphas(cal, ["t0", "t1", "t2"], 0.05) == [0.05] * 3
-
-    def test_quantile_estimate_is_conservative(self):
-        """The estimate sits below the median-unbiased quantile."""
-        grid = np.array([[i / 20000 for i in range(20000)]], dtype=np.float32)
-        conservative = _conservative_quantile(grid, 0.05)[0]
-        assert conservative < 0.05
-        # ...but converges toward it as B grows.
-        small = _conservative_quantile(grid[:, :2000] * 10, 0.05)[0]
-        assert small / 0.05 < conservative / 0.05
-
-    def test_granularity_floor_applies_for_large_m(self):
-        """With m > B*alpha, alpha/m falls under 1/B and the floor takes over."""
-        rng = default_rng(3)
-        b, m = 4000, 500
-        cal = make_calibration({f"t{j}": rng.random(b).tolist() for j in range(m)})
-        assert 0.05 / m < 1.0 / b  # premise: Bonferroni is below the floor
-        c = _calibrated_alphas(cal, [f"t{j}" for j in range(m)], 0.05)
-        assert c[0] == pytest.approx(1.0 / b)
-
-    def test_subsetting_matches_a_standalone_matrix(self):
-        """The ladder over a subset equals that of a calibration built from it.
-
-        This is what lets `-k` / `--lf` / single-file runs still use the cache.
-        """
-        rng = default_rng(2)
-        cols = {f"t{j}": rng.random(4000).tolist() for j in range(5)}
-        full = _calibrated_alphas(make_calibration(cols), ["t1", "t3"], 0.05)
-        subset = _calibrated_alphas(
-            make_calibration({k: cols[k] for k in ("t1", "t3")}), ["t1", "t3"], 0.05
-        )
-        assert full == subset
-
-    def test_missing_nodeid_raises(self):
-        cal = make_calibration({"t0": [0.5] * 4000})
-        with pytest.raises(_CalibrationError, match="absent from the calibration"):
-            _calibrated_alphas(cal, ["t0", "t_new"], 0.05)
-
-    def test_too_few_order_statistics_raises(self):
-        cal = make_calibration({"t0": [0.5] * 100})
-        with pytest.raises(_CalibrationError, match="too small at alpha"):
-            _calibrated_alphas(cal, ["t0"], 0.05)
-
-
-# ---------------------------------------------------------------------------
-# Calibration: file round trip and fallback behaviour
-# ---------------------------------------------------------------------------
-
-CORRELATED_SUITE = """
-    def sample(rng):
-        return float(rng.random())
-
-    def test_a(assertNotReject, ztest_sample_size):
-        n = ztest_sample_size(effect_size=0.3)
-        with open("n_a.txt", "w") as f:
-            f.write(str(n))
-        assertNotReject(0.5, null_sample=sample)
-
-    def test_b(assertNotReject, ztest_sample_size):
-        n = ztest_sample_size(effect_size=0.3)
-        with open("n_b.txt", "w") as f:
-            f.write(str(n))
-        assertNotReject(0.5, null_sample=sample)
-"""
-
-
-def wy_args(*extra, resamples=4000):
-    return ("--correction=westfall-young", f"--resamples={resamples}", *extra)
-
-
-def test_calibration_round_trip_shrinks_sample_size(pytester):
-    """Calibrate, then re-run: the recorded correlation loosens the threshold.
-
-    Both tests draw their nulls from the same rng stream, so they are perfectly
-    correlated and c1 should approach alpha rather than alpha/2.
-    """
-    pytester.makepyfile(CORRELATED_SUITE)
-
-    first = pytester.runpytest(*wy_args())
-    first.assert_outcomes(passed=2)
-    n_uncalibrated = int((pytester.path / "n_a.txt").read_text())
-
-    path = pytester.path / ".familywise-calibration.npz"
-    assert path.exists()
-    with np.load(path) as data:
-        assert int(data["version"]) == CALIBRATION_VERSION
-        assert int(data["resamples"]) == 4000
-        assert "pilot_n" not in data  # dropped in format version 2
-        assert data["nulls"].shape == (2, 4000)
-        assert data["nulls"].dtype == np.float32
-        assert sorted(str(n) for n in data["nodeids"]) == [
-            "test_calibration_round_trip_shrinks_sample_size.py::test_a",
-            "test_calibration_round_trip_shrinks_sample_size.py::test_b",
-        ]
-
-    second = pytester.runpytest(*wy_args())
-    second.assert_outcomes(passed=2)
-    n_calibrated = int((pytester.path / "n_a.txt").read_text())
-
-    second.stdout.fnmatch_lines(["calibration: sizing alpha=*for 2 tests*"])
-    assert n_calibrated < n_uncalibrated
-
-
-def test_calibration_reports_and_falls_back_on_unknown_test(pytester):
-    """A test absent from the cache => warn, and size exactly as Holm would."""
-    pytester.makepyfile(CORRELATED_SUITE)
-    pytester.runpytest(*wy_args())
-    n_two_tests = int((pytester.path / "n_a.txt").read_text())
-
-    # Add a third test that the calibration has never seen.
-    pytester.makepyfile(CORRELATED_SUITE + """
-    def test_c(assertNotReject):
-        assertNotReject(0.5, null_sample=sample)
-    """)
-    result = pytester.runpytest(*wy_args())
-    result.stdout.fnmatch_lines(["calibration: *absent from the calibration*Holm*"])
-    # Holm's ladder for the first requester of m=3 is alpha/3.
-    assert int((pytester.path / "n_a.txt").read_text()) != n_two_tests
-
-
-def test_calibration_survives_subset_run(pytester):
-    """Selecting a subset still uses the cache — no fallback warning."""
-    pytester.makepyfile(CORRELATED_SUITE)
-    pytester.runpytest(*wy_args())
-
-    result = pytester.runpytest(*wy_args(), "-k", "test_a")
-    result.assert_outcomes(passed=1)
-    result.stdout.fnmatch_lines(["calibration: sizing alpha=*for 1 tests*"])
-    result.stdout.no_fnmatch_line("*absent*")
-
-
-def test_calibration_reused_at_a_different_alpha(pytester):
-    """The stored matrix is alpha-free, so changing alpha needs no re-run.
-
-    Raising alpha, not lowering it: a smaller alpha needs a larger B to keep
-    B*alpha order statistics, which is a separate (and correct) fallback.
-    """
-    pytester.makepyfile(CORRELATED_SUITE)
-    pytester.runpytest(*wy_args())
-    stamp = (pytester.path / ".familywise-calibration.npz").stat().st_mtime_ns
-
-    result = pytester.runpytest(*wy_args("--alpha=0.10"))
-    result.assert_outcomes(passed=2)
-    result.stdout.fnmatch_lines(["calibration: sizing alpha=*"])
-    result.stdout.no_fnmatch_line("*absent*")
-    # Not rewritten.
-    assert (pytester.path / ".familywise-calibration.npz").stat().st_mtime_ns == stamp
-
-
-def test_too_few_resamples_falls_back(pytester):
-    """B*alpha < 100 is too noisy to size against."""
-    pytester.makepyfile(CORRELATED_SUITE)
-    pytester.runpytest(*wy_args(resamples=200))
-    result = pytester.runpytest(*wy_args(resamples=200))
-    result.stdout.fnmatch_lines(["calibration: --resamples=200 too small*2000*Holm*"])
-
-
-def test_corrupt_calibration_falls_back_without_crashing(pytester):
-    """A damaged cache may only cost power, never break the suite."""
-    pytester.makepyfile(CORRELATED_SUITE)
-    (pytester.path / ".familywise-calibration.npz").write_bytes(b"not an npz file")
-
-    result = pytester.runpytest(*wy_args())
-    result.assert_outcomes(passed=2)
-    result.stdout.fnmatch_lines(["calibration: unreadable*Holm*"])
-
-
-def test_deleting_the_file_recalibrates(pytester):
-    """Deleting the calibration is how you re-record it.
-
-    There is no --recalibrate flag: absence of the file *is* the record signal,
-    so `rm` is the whole interface.
-    """
-    pytester.makepyfile(CORRELATED_SUITE)
-    path = pytester.path / ".familywise-calibration.npz"
-
-    pytester.runpytest(*wy_args())                       # no cache -> Holm sizing
-    n_holm = int((pytester.path / "n_a.txt").read_text())
-
-    pytester.runpytest(*wy_args())                       # cache hit -> smaller
-    assert int((pytester.path / "n_a.txt").read_text()) < n_holm
-
-    path.unlink()
-    result = pytester.runpytest(*wy_args())
-    result.stdout.fnmatch_lines([
-        "calibration: recording a new calibration*",
-        "calibration: wrote *",
-    ])
-    assert path.exists()
-    assert int((pytester.path / "n_a.txt").read_text()) == n_holm
-
-
-def test_recording_run_sizes_with_holms_ladder(pytester):
-    """A recording run sizes with Holm's ladder, same as an uncalibrated run.
-
-    Each rung of the calibrated ladder brackets above Holm's matching rung, so
-    the pilot's n is an upper bound test by test — no need to charge every test
-    the most stringent rung just to keep the recorded matrix comparable.
-    """
-    pytester.makepyfile(CORRELATED_SUITE)
-    result = pytester.runpytest(*wy_args())
-    result.assert_outcomes(passed=2)
-    n_a = int((pytester.path / "n_a.txt").read_text())
-    n_b = int((pytester.path / "n_b.txt").read_text())
-    # m=2: rung 1 is alpha/2, rung 2 is alpha.
-    assert n_a == _ztest_n(0.05 / 2, 0.8, 0.3)
-    assert n_b == _ztest_n(0.05, 0.8, 0.3)
-    assert n_b < n_a
-
-
-def test_calibrated_ladder_shrinks_every_rung(pytester):
-    """Loading a calibration may never enlarge any test's n.
-
-    The pilot sizes at Holm's rung k, the calibrated run at c_k >= that rung, so
-    every test shrinks or holds — the guarantee the module docstring makes.
-    """
-    pytester.makepyfile(CORRELATED_SUITE)
-    pytester.runpytest(*wy_args())  # pilot: records, sizes with Holm
-    pilot = [int((pytester.path / f"n_{t}.txt").read_text()) for t in ("a", "b")]
-
-    pytester.runpytest(*wy_args())  # cache hit: sizes with the c_k ladder
-    loaded = [int((pytester.path / f"n_{t}.txt").read_text()) for t in ("a", "b")]
-
-    assert all(new <= old for new, old in zip(loaded, pilot))
-    assert loaded[0] < pilot[0]  # rung 1 is where a correlated suite pays off
-
-
-def test_unresolved_dependence_says_to_raise_resamples(pytester):
-    """Falling back to the Bonferroni clamp must not look like a success.
-
-    Two genuinely independent tests, so the estimate lands on the clamp; the
-    report has to name the knob instead of printing alpha/m as if it measured
-    something.
-    """
-    pytester.makepyfile("""
-        def test_a(assertNotReject, ztest_sample_size):
-            ztest_sample_size(effect_size=0.3)
-            assertNotReject(0.5, null_sample=lambda rng: float(rng.random()))
-
-        def test_b(assertNotReject, ztest_sample_size):
-            ztest_sample_size(effect_size=0.3)
-            # Consumes the stream differently, so the columns are independent.
-            def sample(rng):
-                rng.random(7)
-                return float(rng.random())
-            assertNotReject(0.5, null_sample=sample)
-    """)
-    pytester.runpytest(*wy_args())
-    result = pytester.runpytest(*wy_args())
-    result.stdout.fnmatch_lines(["calibration: no dependence resolved at B=4000*"])
-
-
-def test_holm_run_ignores_a_leftover_calibration(pytester):
-    """A calibration is only valid for the procedure that produced it.
-
-    Loading c1 under --correction=holm would size against c1 >= alpha/m while the
-    run actually applies Holm's stricter ladder -- under-sizing every test, the
-    one direction sizing must never go.
-    """
-    pytester.makepyfile(CORRELATED_SUITE)
-    pytester.runpytest(*wy_args())          # records a calibration
-    assert (pytester.path / ".familywise-calibration.npz").exists()
-
-    result = pytester.runpytest("--alpha=0.05")   # holm, cache present
-    result.assert_outcomes(passed=2)
-    result.stdout.no_fnmatch_line("*calibration: sizing alpha*")
-    # Holm's own ladder, rung 1 of 2.
-    assert int((pytester.path / "n_a.txt").read_text()) == _ztest_n(
-        0.05 / 2, 0.8, 0.3
-    )
-
-
-def test_outsider_gets_raw_alpha_even_with_a_calibration_loaded(pytester):
-    """c1 applies to the family; a test outside it is never corrected."""
-    pytester.makepyfile(CORRELATED_SUITE + """
-    def test_outsider(ztest_sample_size):
-        with open("n_out.txt", "w") as f:
-            f.write(str(ztest_sample_size(effect_size=0.3)))
-    """)
-    pytester.runpytest(*wy_args())
-    result = pytester.runpytest(*wy_args())
-    result.stdout.fnmatch_lines(["calibration: sizing alpha=*"])
-    assert int((pytester.path / "n_out.txt").read_text()) == _ztest_n(
-        0.05, 0.8, 0.3
-    )
-
-
-def test_calibration_survives_a_changed_power(pytester):
-    """Sizing knobs may move between runs without invalidating the cache.
-
-    The recorded columns are null draws; --power enters only the sample-size
-    formula, not the null distribution, so the cache still applies.
-    """
-    pytester.makepyfile(CORRELATED_SUITE)
-    pytester.runpytest(*wy_args(), "--power=0.8")
-
-    result = pytester.runpytest(*wy_args(), "--power=0.99")
-    result.stdout.fnmatch_lines(["calibration: sizing alpha=*"])
-    result.assert_outcomes(passed=2)
-
-
-def test_holm_run_writes_no_calibration(pytester):
-    """Only westfall-young collects nulls, so only it can calibrate."""
-    pytester.makepyfile(CORRELATED_SUITE.replace(", null_sample=sample", ""))
-    pytester.runpytest("--alpha=0.05")
-    assert not (pytester.path / ".familywise-calibration.npz").exists()
-
-
-def test_calibration_can_be_disabled(pytester):
-    pytester.makepyfile(CORRELATED_SUITE)
-    pytester.runpytest(*wy_args("--calibration="))
-    assert not (pytester.path / ".familywise-calibration.npz").exists()
-
-
-def test_calibration_does_not_change_the_correction(pytester):
-    """Sizing may only affect power — never which hypotheses are rejected.
-
-    Same suite, with and without a calibration file: identical verdicts and
-    identical adjusted p-values.
-    """
-    src = """
-        def sample(rng):
-            return float(rng.random())
-
-        def test_a(assertNotReject): assertNotReject(0.03, null_sample=sample)
-        def test_b(assertNotReject): assertNotReject(0.60, null_sample=sample)
-    """
-    pytester.makepyfile(src)
-    first = pytester.runpytest(*wy_args())
-    assert (pytester.path / ".familywise-calibration.npz").exists()
-    second = pytester.runpytest(*wy_args())
-
-    def verdicts(result):
-        return [
-            line.strip()
-            for line in result.stdout.lines
-            if "adjusted p=" in line
-        ]
-
-    assert verdicts(first) == verdicts(second)
-    assert verdicts(first)  # non-empty, or the assertion above is vacuous
-
 
 # ---------------------------------------------------------------------------
 # Westfall-Young end-to-end
@@ -1057,15 +640,14 @@ def test_ks_sample_size_fixture(pytester):
 
 
 # ---------------------------------------------------------------------------
-# The Holm sizing ladder: who consumes a rung, and in what order
+# Sizing: every member of the family gets alpha/m, and only members count
 # ---------------------------------------------------------------------------
 
-def test_non_participating_test_does_not_consume_a_ladder_rung(pytester):
+def test_non_participating_test_does_not_inflate_m(pytester):
     """A test that sizes but never calls assertNotReject is not in the family.
 
-    It used to bump the shared counter, pushing every later test onto a looser
-    rung (and some past the end of the ladder onto the full alpha), which
-    silently under-sized them.
+    Counting it would raise m for everyone else, over-sizing the whole suite for
+    a test whose p-value is never adjusted at all.
     """
     pytester.makepyfile("""
         import json, pathlib
@@ -1091,20 +673,19 @@ def test_non_participating_test_does_not_consume_a_ladder_rung(pytester):
     def n_of(name):
         return json.loads((pytester.path / f"{name}.json").read_text())
 
-    # m=2 participating tests, so the ladder is alpha/2 then alpha.
+    # m=2 participating tests, so both size against alpha/2 -- position in the
+    # file buys nothing, since either could be the one that lands at rank 1.
     assert n_of("first") == _ztest_n(0.05 / 2, 0.8, 0.3)
-    assert n_of("second") == _ztest_n(0.05, 0.8, 0.3)
+    assert n_of("second") == _ztest_n(0.05 / 2, 0.8, 0.3)
     # The outsider is uncorrected: its p-value is never adjusted.
     assert n_of("outsider") == _ztest_n(0.05, 0.8, 0.3)
 
 
-def test_rung_follows_collection_position_not_request_order(pytester):
-    """Each participating test occupies its own rung, whether or not it sizes.
+def test_family_members_count_toward_m_even_if_they_never_size(pytester):
+    """m is family membership, not a count of who asked for a sample size.
 
-    The middle test is in the family but never asks for a sample size.  Keying k
-    off collection position leaves it holding rung 2, so the third test gets
-    rung 3 (full alpha).  Request-order numbering would instead compact the
-    ladder and hand the third test rung 2.
+    The middle test uses assertNotReject but never sizes.  It still competes for
+    rank 1 against the other two, so it still costs them a factor in m.
     """
     pytester.makepyfile("""
         import json, pathlib
@@ -1125,16 +706,14 @@ def test_rung_follows_collection_position_not_request_order(pytester):
     """)
     pytester.runpytest("--alpha=0.05").assert_outcomes(passed=3)
 
-    assert json.loads((pytester.path / "a.json").read_text()) == _ztest_n(
-        0.05 / 3, 0.8, 0.3
-    )
-    assert json.loads((pytester.path / "c.json").read_text()) == _ztest_n(
-        0.05, 0.8, 0.3
-    )
+    for name in ("a", "c"):
+        assert json.loads((pytester.path / f"{name}.json").read_text()) == _ztest_n(
+            0.05 / 3, 0.8, 0.3
+        )
 
 
 def test_every_sizing_fixture_in_a_test_sees_the_same_alpha(pytester):
-    """One test, several sizing fixtures, one rung between them."""
+    """One test, several sizing fixtures, one threshold between them."""
     pytester.makepyfile("""
         import json, pathlib
 
@@ -1152,7 +731,7 @@ def test_every_sizing_fixture_in_a_test_sees_the_same_alpha(pytester):
     pytester.runpytest("--alpha=0.05").assert_outcomes(passed=2)
 
     z_n, ks_n = json.loads((pytester.path / "both.json").read_text())
-    # Both fixtures must have used rung 1 of 2, i.e. alpha/2.
+    # Both fixtures must have used the family threshold, alpha/2.
     assert z_n == _ztest_n(0.05 / 2, 0.8, 0.3)
     assert ks_n == _ks_n(0.05 / 2, 0.8, 0.1)
 

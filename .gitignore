@@ -2,4 +2,3 @@ docs
 uv.lock
 __pycache__
 .DS_Store
-.familywise-calibration.npz

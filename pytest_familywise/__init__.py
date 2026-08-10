@@ -27,41 +27,18 @@ sized for the desired per-test power before running:
 
 The sample-size fixtures automatically use corrected significance levels rather
 than the raw familywise alpha.  The plugin records which tests use
-``assertNotReject`` at collection time; the *k*-th of those *m* tests, in
-collection order, sizes against ``alpha / (m - k + 1)``.  This ensures each test
-is properly powered for a threshold it may face during the step-down procedure.
-Tests outside that set are never corrected, so they size against the raw alpha.
+``assertNotReject`` at collection time, and every one of those *m* tests sizes
+against ``alpha / m``.  Tests outside that set are never corrected, so they size
+against the raw alpha.
 
-Calibration
------------
-Holm's ``alpha / (m - k + 1)`` is conservative under ``westfall-young``, whose
-real critical values depend on the null distribution the tests generate and so
-are unknown before they run.  ``--calibration=PATH`` breaks that circularity: a
-westfall-young run with no calibration file records every test's null column to
-one, and later runs load it and size against the *measured* ladder
-
-    c_k = the alpha-quantile of the per-resample minimum null p-value
-          over the tests at collection positions k..m
-
-which is the threshold the rank-k hypothesis faces under the step-down
-procedure.  Theory brackets each rung as ``alpha/(m-k+1) <= c_k <= alpha``, and
-the estimates are clamped into that range, so calibrated sizing can only shrink
-sample sizes -- rung by rung, against Holm's own rung.
-
-This only affects **power**.  FWER control always comes from the current run's
-own null draws, so a missing, stale or corrupt calibration costs sample size and
-nothing else -- every failure path warns and falls back to Holm.
-
-Two things worth knowing before enabling it:
-
-* The gain comes entirely from *positive dependence between tests*.  Independent
-  tests give ``c_k ~ alpha/(m-k+1)``, i.e. Holm, i.e. no gain at all -- the win
-  needs tests that share a dataset or an RNG.
-* Resolving a gain takes resamples.  The estimate carries roughly
-  ``1/sqrt(B*alpha)`` relative error and is deliberately biased low, so a modest
-  real gain can be swallowed at small *B*.  When that happens the run says
-  ``no dependence resolved at B=...`` rather than silently reporting Holm's own
-  value; raise ``--resamples``.
+Why ``alpha / m`` for all of them rather than Holm's ``alpha / (m - k + 1)``
+ladder: a test's rung depends on its p-value *rank*, which is not known until
+the suite has run.  A test with a real effect produces a small p-value, so it
+lands at (or near) rank 1 and faces ``alpha / m`` whatever its position in the
+file.  Sizing any test for a laxer rung is betting it is not the broken one, and
+there is nothing to place that bet with.  The cost is mild -- the penalty grows
+like ``log m``, roughly 1.7x the raw-alpha sample size at m=10 -- and it is the
+only sizing that keeps the requested power for whichever test actually breaks.
 
 Loading
 -------
@@ -87,9 +64,8 @@ pytest_plugins = ["pytest_familywise"]
 from __future__ import annotations
 
 import math
-import os
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Mapping, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import numpy as np
 from numpy.random import default_rng
@@ -326,184 +302,6 @@ CORRECTION_NAMES = {
 
 
 # ---------------------------------------------------------------------------
-# Calibration: reuse a recorded null matrix to size samples against the
-# Westfall-Young critical value instead of Holm's conservative bound.
-#
-# This only ever affects POWER.  FWER control comes from _apply_correction,
-# which recomputes the correction from the current run's own null draws, so a
-# stale or missing calibration yields an underpowered test, never an invalid
-# one.  Every failure path below is therefore "warn and fall back to Holm".
-# ---------------------------------------------------------------------------
-
-CALIBRATION_VERSION = 2
-
-DEFAULT_CALIBRATION = ".familywise-calibration.npz"
-
-# The alpha-quantile of the minima is estimated from about B*alpha order
-# statistics; relative error is ~1/sqrt(B*alpha).  Below 100 the estimate is too
-# noisy to size against (32% at B=1000, alpha=0.01).
-MIN_ORDER_STATS = 100
-
-
-class _CalibrationError(Exception):
-    """Unusable calibration file.  Carries a human-readable reason."""
-
-
-@dataclass
-class _Calibration:
-    resamples: int
-    columns: Dict[str, "np.ndarray"]  # nodeid -> (B,) null p-values
-
-
-def _conservative_quantile(minima: "np.ndarray", alpha: float) -> "np.ndarray":
-    """Lower confidence bounds on the alpha-quantile of each row of ``minima``.
-
-    The alpha-quantile sits at order statistic ``B*alpha``, whose standard error
-    is ``sqrt(B*alpha*(1-alpha))``.  Stepping two of those down biases the
-    estimate small, and for sizing "small" is the safe direction: a smaller
-    critical value means a larger sample.  Without this an unlucky pilot run
-    silently under-sizes the whole suite.
-
-    ``minima`` is ``(rows, B)``; the order statistic index depends only on B and
-    alpha, so every row is selected in one partition.
-    """
-    b = minima.shape[1]
-    target = b * alpha
-    # -1 converts the 1-based order statistic to a 0-based index.
-    index = int(math.floor(target - 2.0 * math.sqrt(target * (1.0 - alpha)))) - 1
-    index = max(0, min(b - 1, index))
-    return np.partition(minima, index, axis=1)[:, index].astype(float)
-
-
-def _calibrated_alphas(
-    calibration: _Calibration,
-    nodeids: Sequence[str],
-    alpha: float,
-) -> List[float]:
-    """The Westfall-Young critical value ladder for a family of ``nodeids``.
-
-    The step-down procedure compares the rank-k p-value against the
-    alpha-quantile of the minimum null p-value over the hypotheses still
-    standing at step k.  So there is a whole ladder of critical values, not one:
-
-        c_k = alpha-quantile of  min over {k, ..., m} of the null columns
-
-    with ``nodeids`` in collection order, exactly the convention
-    ``get_corrected_alpha`` already uses for Holm.  ``c_k`` is the calibrated
-    counterpart of Holm's ``alpha / (m - k + 1)``, and is monotone increasing in
-    k for free: the minimum over a superset is never larger.
-
-    Recomputed over the nodeids actually present in this run, so selecting a
-    subset (``-k``, ``--lf``, one file) still uses the cache rather than falling
-    back.
-
-    Raises ``_CalibrationError`` if any nodeid is missing or B*alpha is too small
-    for the quantile to mean anything.
-    """
-    missing = [n for n in nodeids if n not in calibration.columns]
-    if missing:
-        raise _CalibrationError(
-            f"{len(missing)} test(s) absent from the calibration, "
-            f"first: {missing[0]}"
-        )
-    b = calibration.resamples
-    if b * alpha < MIN_ORDER_STATS:
-        raise _CalibrationError(
-            f"--resamples={b} too small at alpha={alpha}: needs "
-            f"{math.ceil(MIN_ORDER_STATS / alpha)} for a stable quantile"
-        )
-
-    matrix = np.stack([calibration.columns[n] for n in nodeids])  # (m, B)
-    # Row k of tail_min is the per-resample minimum over the tail {k, ..., m}:
-    # reverse, running minimum, reverse back -- the same trick the correction
-    # itself uses, applied to the recorded matrix instead of the live one.
-    tail_min = np.minimum.accumulate(matrix[::-1])[::-1]
-    c = _conservative_quantile(tail_min, alpha)
-
-    # Theory brackets each rung as alpha/(m-k+1) <= c_k <= alpha, whatever the
-    # dependence.  For a tail set S: Bonferroni's union bound gives
-    # P(min_S <= alpha/|S|) <= alpha for the lower end, and
-    # P(min_S <= alpha) >= P(p_1 <= alpha) = alpha for the upper.  Clamping into
-    # that bracket removes estimation error wherever the answer is already
-    # known, and guarantees each rung is never stricter than Holm's own rung --
-    # so calibrated sizing can only shrink n, test by test.
-    m = len(nodeids)
-    holm = alpha / (m - np.arange(m))  # alpha / (m - k + 1) for k = 1..m
-    # 1/B floor: the procedure cannot produce an adjusted p-value below 1/B, so
-    # sizing for anything smaller targets a threshold it can never attain.
-    return np.minimum(alpha, np.maximum(np.maximum(c, holm), 1.0 / b)).tolist()
-
-
-def _calibration_mode(
-    path: Optional[str],
-    correction: str,
-    is_xdist_worker: bool,
-) -> str:
-    """Whether this run records a calibration, loads one, or ignores them.
-
-    Only westfall-young generates null draws, so only it can record -- and only
-    its critical values may be used for sizing.  Loading a stale file under
-    ``holm`` would size against c1 >= alpha/m while the run actually applies
-    Holm's stricter ladder, which is the one direction sizing must never go.
-
-    xdist workers each collect a subset, so every worker would write a partial
-    matrix and the last would win; they neither record nor load.
-    """
-    if not path or correction != "westfall-young" or is_xdist_worker:
-        return "off"
-    return "load" if os.path.exists(path) else "record"
-
-
-def _load_calibration(path: str) -> _Calibration:
-    """Read a calibration file, raising ``_CalibrationError`` if unusable."""
-    keys = ("version", "resamples", "base_seed", "nodeids", "nulls")
-    try:
-        with np.load(path) as data:
-            arrays = {k: data[k] for k in keys}
-    except FileNotFoundError:
-        raise _CalibrationError("not found")
-    except Exception as exc:  # unreadable, truncated, not an npz, missing key
-        raise _CalibrationError(f"unreadable ({type(exc).__name__}: {exc})")
-
-    version, seed = int(arrays["version"]), int(arrays["base_seed"])
-    if version != CALIBRATION_VERSION:
-        raise _CalibrationError(
-            f"format version {version}, expected {CALIBRATION_VERSION}"
-        )
-    if seed != _BASE_SEED:
-        raise _CalibrationError(
-            f"recorded with base seed {seed}, this build uses {_BASE_SEED}"
-        )
-
-    resamples, nulls = int(arrays["resamples"]), arrays["nulls"]
-    nodeids = [str(n) for n in arrays["nodeids"]]
-    if nulls.shape != (len(nodeids), resamples):
-        raise _CalibrationError(
-            f"expected a {(len(nodeids), resamples)} matrix, got {nulls.shape}"
-        )
-    return _Calibration(resamples=resamples, columns=dict(zip(nodeids, nulls)))
-
-
-def _write_calibration(
-    path: str,
-    resamples: int,
-    columns: Mapping[str, Sequence[float]],
-) -> None:
-    nodeids = sorted(columns)
-    # Write through a file object: np.savez_compressed silently appends ".npz"
-    # when handed a path, which would not match what we later try to load.
-    with open(path, "wb") as handle:
-        np.savez_compressed(
-            handle,
-            version=CALIBRATION_VERSION,
-            resamples=resamples,
-            base_seed=_BASE_SEED,
-            nodeids=np.array(nodeids),
-            nulls=np.array([columns[n] for n in nodeids], dtype=np.float32),
-        )
-
-
-# ---------------------------------------------------------------------------
 # Internal result record
 # ---------------------------------------------------------------------------
 
@@ -532,32 +330,11 @@ class FamilywisePlugin:
     power: float
     correction: str
     resamples: int
-    calibration_path: Optional[str]
-    is_xdist_worker: bool
 
-    mode: str = field(init=False)
-    # The c_k ladder from a loaded calibration, indexed by collection position;
-    # None means size with Holm's ladder.
-    _sizing_alphas: Optional[List[float]] = field(init=False, default=None)
-    # Terminal-summary lines, in the order they were decided.
-    _notes: List[str] = field(init=False, default_factory=list)
     _reporters: Dict[str, PValueReporter] = field(init=False, default_factory=dict)
     _corrected: List[_CorrectedResult] = field(init=False, default_factory=list)
     # Tests participating in the correction (i.e. using assertNotReject).
     _participating: List[str] = field(init=False, default_factory=list)
-
-    def __post_init__(self) -> None:
-        self.mode = _calibration_mode(
-            self.calibration_path, self.correction, self.is_xdist_worker
-        )
-        if (
-            self.calibration_path
-            and self.correction == "westfall-young"
-            and self.is_xdist_worker
-        ):
-            self._notes.append(
-                "cannot record under xdist; use -p no:xdist to record one"
-            )
 
     # ------------------------------------------------------------------
     # Hook: record which tests participate in the correction
@@ -573,41 +350,6 @@ class FamilywisePlugin:
             for item in items
             if "assertNotReject" in getattr(item, "fixturenames", ())
         ]
-        self._load_sizing_alpha()
-
-    def _load_sizing_alpha(self) -> None:
-        """Settle the sizing threshold once, now that the family is known."""
-        if self.mode == "record":
-            self._notes.append("recording a new calibration; sizing with Holm")
-        if self.mode != "load" or not self._participating:
-            return
-
-        m = len(self._participating)
-        try:
-            calibration = _load_calibration(self.calibration_path or "")
-            ladder = _calibrated_alphas(
-                calibration, self._participating, self.alpha
-            )
-        except _CalibrationError as exc:
-            self._notes.append(f"{exc}; sizing with Holm")
-            return
-        self._sizing_alphas = ladder
-        holm = self.alpha / m
-        self._notes.append(
-            f"sizing alpha={ladder[0]:.6f}..{ladder[-1]:.6f} for {m} tests "
-            f"(Holm would use {holm:.6f}..{self.alpha:.6f})"
-        )
-        # Rung 1 only: the top rung is the alpha-quantile of a single column, so
-        # it sits at alpha under any dependence and would always read as
-        # "collapsed".  Rung 1 is where a real gain shows up.
-        if m > 1 and math.isclose(ladder[0], holm):
-            # The estimate fell to the Bonferroni clamp, so either the tests
-            # really are independent or B is too small to resolve the gain.
-            # Say which knob to turn rather than reporting a silent no-op.
-            self._notes.append(
-                f"no dependence resolved at B={self.resamples}; "
-                f"raise --resamples if these tests share data"
-            )
 
     # ------------------------------------------------------------------
     # Corrected alpha for sample-size fixtures
@@ -616,35 +358,21 @@ class FamilywisePlugin:
     def get_corrected_alpha(self, nodeid: str) -> float:
         """Return the corrected alpha for a test's sample-size calculation.
 
-        Both paths are the same ladder, indexed by the test's 1-based position k
-        among the m participating tests in collection order.  Without a
-        calibration that ladder is Holm's ``alpha / (m - k + 1)``; with one it is
-        the measured ``c_k`` (see ``_calibrated_alphas``), which brackets above
-        Holm's rung k -- so loading a calibration can only shrink n, test by
-        test.
+        Every participating test gets ``alpha / m``: the rung a rank-1 hypothesis
+        faces, and the harshest any test can face under the step-down procedure.
+        A test with a real effect has a small p-value, so it sorts to rank 1
+        whatever its position in the file -- sizing it for a laxer rung would bet
+        that it is not the broken one, and nothing in the run supports that bet.
 
-        Keying k off collection order rather than the order in which tests happen
-        to *ask* for a size matters twice over: tests outside the family cannot
-        consume a rung of the ladder, and the answer no longer depends on which
-        tests ran, so it is stable under -k, --lf and pytest-randomly.  Since
-        collection order is execution order by default, ordering expensive tests
-        last still earns them the smaller samples.
-
-        The convention is an approximation in both cases: a test is sized for the
-        rung matching its collection position, but at run time it faces the rung
-        matching its observed p-value *rank*.  A test with a real effect tends to
-        land at rank 1 and face the harshest rung whatever its position.
+        Under westfall-young the true rank-1 rung is somewhat above ``alpha / m``
+        (that is the whole point of the procedure), so this over-sizes there.
+        Erring large costs samples; erring small costs the power the caller
+        asked for.
         """
+        # Tests outside the family are never adjusted, so nothing corrects them.
         if nodeid not in self._participating:
-            # Not part of the correction family -- this test's p-value is never
-            # adjusted, so no correction applies to its sample size either.
             return self.alpha
-
-        m = len(self._participating)
-        k = self._participating.index(nodeid) + 1
-        if self._sizing_alphas is not None:
-            return self._sizing_alphas[k - 1]
-        return self.alpha / (m - k + 1)
+        return self.alpha / len(self._participating)
 
     # ------------------------------------------------------------------
     # Correction logic
@@ -682,36 +410,14 @@ class FamilywisePlugin:
 
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         self._apply_correction()
-        self._maybe_write_calibration()
         if any(not r.passed for r in self._corrected):
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
-
-    def _maybe_write_calibration(self) -> None:
-        """Record the null matrix, if this is a recording run that collected one."""
-        if self.mode != "record":
-            return
-        columns = {
-            nodeid: r.nulls
-            for nodeid, r in self._reporters.items()
-            if r.nulls is not None
-        }
-        if not columns:
-            return
-        _write_calibration(
-            self.calibration_path or "", self.resamples, columns
-        )
-        self._notes.append(
-            f"wrote {self.calibration_path} ({len(columns)} tests, "
-            f"B={self.resamples})"
-        )
 
     # ------------------------------------------------------------------
     # Hook: update terminal stats and print summary
     # ------------------------------------------------------------------
 
     def pytest_terminal_summary(self, terminalreporter, exitstatus: int, config: pytest.Config) -> None:
-        for note in self._notes:
-            terminalreporter.write_line(f"calibration: {note}")
         if not self._corrected:
             return
 
@@ -788,19 +494,6 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         ),
     )
     parser.addoption(
-        "--calibration",
-        default=DEFAULT_CALIBRATION,
-        metavar="PATH",
-        help=(
-            f"Calibration file of recorded null p-values (default: "
-            f"{DEFAULT_CALIBRATION}).  When present, the sample-size "
-            "fixtures size against the measured Westfall-Young critical value "
-            "instead of Holm's conservative bound; when absent, a "
-            "westfall-young run records one -- so delete the file to "
-            "recalibrate.  Pass an empty string to disable."
-        ),
-    )
-    parser.addoption(
         "--power",
         type=float,
         default=0.8,
@@ -818,9 +511,6 @@ def pytest_configure(config: pytest.Config) -> None:
         power=config.getoption("--power"),
         correction=config.getoption("--correction"),
         resamples=config.getoption("--resamples"),
-        calibration_path=config.getoption("--calibration"),
-        # Set by pytest-xdist on worker processes only.
-        is_xdist_worker=hasattr(config, "workerinput"),
     )
     config.pluginmanager.register(plugin, "familywise-correction")
     config._familywise_plugin = plugin  # type: ignore[attr-defined]
@@ -881,10 +571,11 @@ def assertNotReject(request: pytest.FixtureRequest) -> PValueReporter:
 def ztest_sample_size(request: pytest.FixtureRequest) -> Callable[..., int]:
     """Return required n for a z-test at the session's power and corrected alpha.
 
-    The significance level used is ``alpha / (m - k + 1)`` where *m* is the
-    total number of ``assertNotReject`` tests and *k* is the position (in
-    execution order) at which this test requests a sample size.  This matches
-    the Holm-Bonferroni step-down thresholds so each test is properly powered.
+    The significance level used is ``alpha / m``, where *m* is the total number
+    of ``assertNotReject`` tests.  That is the strictest threshold the step-down
+    procedure can apply, and the one a test with a real effect actually faces:
+    its p-value is small, so it sorts to rank 1.  Tests that do not use
+    ``assertNotReject`` are never corrected and size against the raw alpha.
 
     Usage:
 

@@ -216,121 +216,46 @@ Note that to estimate $P(c(S_L) \leq p_L)$ on Westfall-Young, we take samples of
 |---|---|---|
 | `--alpha` | `0.05` | Family-wise error rate |
 | `--correction` | `holm` | `holm` or `westfall-young` |
-| `--resamples` | `1000` | Null resamples *B* per test (Westfall-Young only) |
+| `--resamples` | `1000` | Null resamples per test (Westfall-Young only) |
 | `--power` | `0.8` | Per-test power used by the sample-size fixtures |
-| `--calibration` | `.familywise-calibration.npz` | Recorded null p-values, used to size samples against the measured threshold. Delete the file to re-record it; empty string disables |
 
-`--power` is per-test, not family-wise.  The sample-size fixtures use
-Holm-Bonferroni corrected significance levels rather than the raw alpha.  At
-collection time the plugin records which tests use `assertNotReject` (*m* of
-them); the *k*-th of those, **in collection order**, sizes against
-`alpha / (m - k + 1)`.  The first receives the most stringent threshold
-(`alpha / m`) and therefore the largest sample size; later tests receive
-progressively relaxed thresholds and smaller samples.  Because of this, it is
-worth ordering your test suite so that more computationally expensive tests come
-later, where the required sample sizes are smaller.
+`--power` is per-test, not family-wise.  The sample-size fixtures use corrected
+significance levels rather than the raw alpha.  At collection time the plugin
+records which tests use `assertNotReject` (*m* of them), and every one of them
+sizes against `alpha / m`.
 
-Two consequences worth knowing:
+A test that uses a sample-size fixture but **not** `assertNotReject` is not in
+the family, so no correction applies to it and it sizes against the raw alpha.
+It also does not raise *m* for anyone else.
 
-- A test that uses a sample-size fixture but **not** `assertNotReject` is not in
-  the family, so no correction applies to it and it sizes against the raw alpha.
-  It does not consume a rung of the ladder.
-- Because *k* is a collection position rather than a count of who asked first,
-  sample sizes are reproducible: they do not shift under `-k`, `--lf`, or
-  `pytest-randomly`.
+### Why `alpha / m` for every test
 
-By default the sample-size fixtures use Holm's threshold under **both**
-procedures. Westfall-Young's adjusted p-values are always ≤ Holm's, so sizing
-against Holm over-sizes safely — your tests come out at least as powered as you
-asked for. To stop over-sizing, calibrate.
+The threshold a test actually faces is set by its p-value **rank**, not by where
+it sits in the file — and the rank isn't known until the whole suite has run.
+The step-down ladder gives rank *k* a threshold of `alpha / (m - k + 1)`, so
+rank 1 faces the strictest rung, `alpha / m`.
 
-## Calibration: sizing against the measured threshold
+A test with a real effect produces a small p-value.  It therefore sorts to (or
+near) rank 1 and faces `alpha / m` regardless of its position.  Sizing any test
+for a laxer rung amounts to betting that it is not the broken one, and there is
+nothing available before the run to place that bet with.  So every test is sized
+for the rung it would face if it were the one to fail.
 
-Westfall-Young's real critical value depends on the null distribution the tests
-generate, so it isn't known before they run. A calibration file breaks that
-circularity — record the null columns once, reuse them to size later runs:
+The cost is milder than it looks, because the penalty grows like `log m`, not
+`m`.  For a z-test at power 0.8, relative to sizing at the uncorrected alpha:
 
-```
-rm -f .familywise-calibration.npz
-pytest --correction=westfall-young --resamples=40000   # records; sizes with Holm
-pytest --correction=westfall-young --resamples=40000   # loads; sizes smaller
-```
+| m | 5 | 10 | 20 | 50 | 100 |
+|---|---|---|---|---|---|
+| n | 1.49× | 1.70× | 1.90× | 2.18× | 2.38× |
 
-```
-calibration: recording a new calibration; sizing with Holm
-calibration: wrote .familywise-calibration.npz (2 tests, B=40000)
-...
-calibration: sizing alpha=0.032212 for 2 tests (Holm would use 0.025000)
-```
+Doubling the size of the suite costs about 10% more samples.  If that still
+matters, the lever with real leverage is *m* itself — split unrelated tests into
+separate runs so they stop paying for each other.
 
-In [`examples/calibration.py`](examples/calibration.py) — a t-test and a sign
-test over one dataset, measured rank correlation 0.48 — that takes *n* from 238
-to 223.
-
-The threshold is
-
-$$c_1 = \text{quantile}_\alpha\left(\min_j P_{b,j}\right)$$
-
-the α-quantile of the per-resample minimum null p-value: the harshest threshold
-any test can face under the step-down procedure, and so the right one to size
-against, since a test with a real effect is the one likely to land at rank 1.
-Theory brackets it as $\alpha/m \le c_1 \le \alpha$ and the estimate is clamped
-into that range, so **calibrated sizing can only shrink sample sizes**.
-
-### What it costs and when it helps
-
-**It only affects power.** FWER control always comes from the current run's own
-null draws, so a missing, stale, subsetted or corrupt calibration costs sample
-size and nothing else. Every failure path warns and falls back to Holm; it never
-degrades silently.
-
-**The gain comes entirely from positive dependence between tests.** Independent
-tests give $c_1 \approx \alpha/m$ — Bonferroni, no gain. Roughly, for the first
-requester at α=0.05:
-
-| m | dependence | n saving |
-|---|---|---|
-| any | independent | 0.3% |
-| 10 | ρ=0.7 | 11% |
-| 50 | ρ=0.9 | 31% |
-| 50 | perfect | 54% |
-
-So this is for suites where many tests hit one shared dataset or RNG. If your
-tests are independent, it will correctly find nothing.
-
-**Resolving a gain costs resamples.** The estimate carries about
-$1/\sqrt{B\alpha}$ relative error and is deliberately biased low (an unlucky
-pilot must not silently under-size your suite), so a modest real gain can be
-swallowed at small *B*. At B=4000 the example above resolves nothing; at B=40000
-it does. When the estimate lands on the Bonferroni clamp the run says so:
-
-```
-calibration: no dependence resolved at B=4000; raise --resamples if these tests share data
-```
-
-**A recording run sizes every test identically** (uniform `alpha/m` rather than
-Holm's ladder). A per-test *n* means a per-test number of draws from the shared
-rng stream, which decorrelates the very columns being recorded — the pilot would
-destroy the dependence it exists to measure.
-
-**The file is not portable across suites.** It is keyed by nodeid, so adding a
-test falls back until you re-record; subsetting with `-k` or `--lf` still works,
-since $c_1$ is recomputed over whichever tests are present. It holds random
-draws and is rewritten wholesale, so gitignore it rather than committing it.
-
-**To re-record, delete it.** Absence of the file *is* the record signal, so `rm`
-is the whole interface — there is no `--recalibrate` flag.
-
-### Where it does not transfer
-
-The cached columns are reused at whatever *n* the loading run picks, which
-assumes the cross-test dependence is stable in *n*. That is asymptotically true
-for continuous, correctly specified tests, and degrades when statistics are
-discrete (chi-square with small expected counts), when tests mix a fixed-size
-fixture with n-sized draws, or when `null_sample` consumes the rng an
-n-dependent number of times. The run warns when the *n* it hands out differs from
-the pilot's by more than 2×; beyond that, delete the file and re-record rather
-than trusting it.
+Under `--correction=westfall-young` the true rank-1 threshold is somewhat above
+`alpha / m`; that gap is exactly what the procedure recovers at decision time.
+Sizing still uses `alpha / m` there, so Westfall-Young runs are over-sized.
+Erring large costs samples, erring small costs the power you asked for.
 
 ## Fixtures
 
