@@ -18,14 +18,9 @@ Two procedures are available via ``--correction``:
 Both are expressed as adjusted p-values: each test's raw p-value is mapped to an
 adjusted value, and the null hypothesis is rejected when ``adjusted <= alpha``.
 
-Three fixtures expose required-sample-size calculations so tests can be
-sized for the desired per-test power before running:
-
-* ``ztest_sample_size(effect_size, two_sided=True)``  – Cohen's d
-* ``chisquare_sample_size(effect_size, df)``           – Cohen's w
-* ``ks_sample_size(effect_size, two_sample=False)``    – max |F−G|, via DKW
-
-The sample-size fixtures automatically use corrected significance levels rather
+Other fixtures expose required-sample-size calculations so tests can be
+sized for the desired per-test power before running.
+The sample-size fixtures use Bonferroni corrected significance levels rather
 than the raw familywise alpha.  The plugin records which tests use
 ``assertNotReject`` at collection time, and every one of those *m* tests sizes
 against ``alpha / m``.  Tests outside that set are never corrected, so they size
@@ -65,7 +60,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
-from typing import Callable, Dict, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence, Set
 
 import numpy as np
 from numpy.random import default_rng
@@ -80,82 +75,23 @@ import pytest
 _BASE_SEED = 0x5EED
 
 
-# ---------------------------------------------------------------------------
-# Sample-size helpers (pure functions, no pytest state)
-# ---------------------------------------------------------------------------
-
 def _ztest_n(alpha: float, power: float, effect_size: float, two_sided: bool = True) -> int:
-    """Minimum n for a one-sample z-test (or two-sample with equal group sizes).
-
-    Parameters
-    ----------
-    effect_size:
-        Cohen's d – the expected difference in means divided by the
-        pooled standard deviation.
-    two_sided:
-        Whether to use a two-sided test (default True).
-
-    Returns
-    -------
-    int
-        Required sample size (per group for a two-sample test).
-    """
     z_alpha = norm.ppf(1 - alpha / 2) if two_sided else norm.ppf(1 - alpha)
     z_beta = norm.ppf(power)
     return math.ceil(((z_alpha + z_beta) / effect_size) ** 2)
 
-
 def _chisquare_n(alpha: float, power: float, effect_size: float, df: int) -> int:
-    """Minimum n for a chi-square goodness-of-fit test.
-
-    Parameters
-    ----------
-    effect_size:
-        Cohen's w = sqrt(sum((p_i - p0_i)^2 / p0_i)).
-    df:
-        Degrees of freedom (number of categories minus 1 for goodness-of-fit).
-
-    Returns
-    -------
-    int
-        Required total sample size.
-    """
-
     critical = chi2.ppf(1 - alpha, df)
 
     def shortfall(n: float) -> float:
         return ncx2.sf(critical, df, n * effect_size ** 2) - power
 
-    # Double upper bound until the power is achievable.
     hi = 4.0
     while shortfall(hi) < 0:
         hi *= 2
     return math.ceil(brentq(shortfall, 1.0, hi))
 
-
 def _ks_n(alpha: float, power: float, effect_size: float, two_sample: bool = False) -> int:
-    """Minimum n for a Kolmogorov-Smirnov test, via the DKW inequality.
-
-    Uses the bound::
-
-        n >= (sqrt(ln(2/alpha)) + sqrt(ln(2/beta)))^2 / (2 * delta^2)
-
-    where ``beta = 1 - power`` and ``delta = effect_size``.
-
-    Parameters
-    ----------
-    effect_size:
-        Maximum absolute CDF difference under H1 (i.e. ||F − G||_∞ ∈ (0, 1]).
-    two_sample:
-        If True, return the per-group sample size for a two-sample test
-        (assuming equal group sizes).  The effective n for the two-sample KS
-        statistic is n1*n2/(n1+n2) = n_each/2 when groups are equal.
-
-    Returns
-    -------
-    int
-        Required sample size (per group when ``two_sample=True``).
-    """
     beta = 1.0 - power
     delta = effect_size
     n = (math.sqrt(math.log(2.0 / alpha)) + math.sqrt(math.log(2.0 / beta))) ** 2 / (
@@ -165,31 +101,13 @@ def _ks_n(alpha: float, power: float, effect_size: float, two_sample: bool = Fal
     # For two equal groups the effective n is n_each/2, so double.
     return n_ceil * 2 if two_sample else n_ceil
 
-
-# ---------------------------------------------------------------------------
-# Public fixture object
-# ---------------------------------------------------------------------------
-
 def _validated(p: float) -> float:
     if not 0.0 <= p <= 1.0:
         raise ValueError(f"p-value must be in [0, 1], got {p!r}")
     return float(p)
 
-
 class PValueReporter:
-    """Callable returned by the ``assertNotReject`` fixture.
-
-    The test calls it once with its computed p-value:
-
-    ```python
-    def test_foo(assertNotReject):
-        p = run_experiment()
-        assertNotReject(p)
-    ```
-
-    Under ``--correction=westfall-young`` a ``null_sample`` callable is also
-    required; see the ``assertNotReject`` fixture docstring.
-    """
+    "Callable returned by the ``assertNotReject`` fixture."
 
     def __init__(self, needs_null: bool = False, resamples: int = 0) -> None:
         self.value: Optional[float] = None
@@ -211,13 +129,6 @@ class PValueReporter:
             )
         self.value = _validated(p)
         if null_sample is not None:
-            # Draw b uses an rng seeded identically across every test, so tests
-            # that apply the same transform to the same data produce aligned
-            # (correlated) null columns -- which is where WY's power comes from.
-            # float64 array rather than a list: 4x less memory held until
-            # sessionfinish (32 MB vs 131 MB at m=100, B=40000) and no conversion
-            # on the way into the correction.  Not float32 -- rounding there could
-            # flip a `null <= p` comparison and change which tests are rejected.
             self.nulls = np.fromiter(
                 (
                     _validated(null_sample(default_rng(_BASE_SEED + b)))
@@ -228,17 +139,9 @@ class PValueReporter:
             )
 
 
-# ---------------------------------------------------------------------------
-# Correction procedures: raw p-values -> adjusted p-values
-#
-# Both are step-down procedures.  Expressing them as adjusted p-values (reject
-# iff adjusted <= alpha) makes the step-down stop condition and monotonicity
-# fall out of the values themselves, so all the pytest plumbing is shared.
-# ---------------------------------------------------------------------------
-
 def _holm_adjusted(
     pvalues: Sequence[float],
-    nulls: Sequence[Optional[Sequence[float]]] = (),  # unused; shared with WY
+    nulls: Sequence[None] = (),  # unused; shared with WY
 ) -> List[float]:
     """Holm-Bonferroni adjusted p-values for p-values sorted ascending.
 
@@ -251,7 +154,6 @@ def _holm_adjusted(
     return np.maximum.accumulate(
         np.minimum(1.0, ranks * np.asarray(pvalues, dtype=float))
     ).tolist()
-
 
 def _westfall_young_adjusted(
     pvalues: Sequence[float],
@@ -300,31 +202,17 @@ CORRECTION_NAMES = {
     "westfall-young": "Westfall-Young",
 }
 
-
-# ---------------------------------------------------------------------------
-# Internal result record
-# ---------------------------------------------------------------------------
-
 @dataclass
 class _CorrectedResult:
+    "Internal result record"
     nodeid: str
     p_value: float
     adjusted: float
     passed: bool
 
-
-# ---------------------------------------------------------------------------
-# Plugin
-# ---------------------------------------------------------------------------
-
-
 @dataclass(eq=False)
 class FamilywisePlugin:
-    """Collects p-values, defers pass/fail, and applies the FWER correction.
-
-    No field carries a default: every value comes from the command line, whose
-    defaults live in ``pytest_addoption`` and nowhere else.
-    """
+    "Collects p-values, defers pass/fail, and applies the FWER correction."
 
     alpha: float
     power: float
@@ -334,49 +222,21 @@ class FamilywisePlugin:
     _reporters: Dict[str, PValueReporter] = field(init=False, default_factory=dict)
     _corrected: List[_CorrectedResult] = field(init=False, default_factory=list)
     # Tests participating in the correction (i.e. using assertNotReject).
-    _participating: List[str] = field(init=False, default_factory=list)
+    _participating: Set[str] = field(init=False, default_factory=set)
 
-    # ------------------------------------------------------------------
-    # Hook: record which tests participate in the correction
-    # ------------------------------------------------------------------
-
-    # trylast: pytest's own -k / -m deselection happens in this same hook, so
-    # running first would count tests that are about to be deselected and
-    # inflate m for the whole family.
+    # Record which tests participate in the correction
     @pytest.hookimpl(trylast=True)
     def pytest_collection_modifyitems(self, items: List[pytest.Item]) -> None:
-        self._participating = [
+        self._participating = {
             item.nodeid
             for item in items
             if "assertNotReject" in getattr(item, "fixturenames", ())
-        ]
-
-    # ------------------------------------------------------------------
-    # Corrected alpha for sample-size fixtures
-    # ------------------------------------------------------------------
+        }
 
     def get_corrected_alpha(self, nodeid: str) -> float:
-        """Return the corrected alpha for a test's sample-size calculation.
-
-        Every participating test gets ``alpha / m``: the rung a rank-1 hypothesis
-        faces, and the harshest any test can face under the step-down procedure.
-        A test with a real effect has a small p-value, so it sorts to rank 1
-        whatever its position in the file -- sizing it for a laxer rung would bet
-        that it is not the broken one, and nothing in the run supports that bet.
-
-        Under westfall-young the true rank-1 rung is somewhat above ``alpha / m``
-        (that is the whole point of the procedure), so this over-sizes there.
-        Erring large costs samples; erring small costs the power the caller
-        asked for.
-        """
-        # Tests outside the family are never adjusted, so nothing corrects them.
         if nodeid not in self._participating:
             return self.alpha
         return self.alpha / len(self._participating)
-
-    # ------------------------------------------------------------------
-    # Correction logic
-    # ------------------------------------------------------------------
 
     def _apply_correction(self) -> None:
         pvalue_items = [
@@ -404,18 +264,10 @@ class FamilywisePlugin:
                 passed=adj > self.alpha,
             ))
 
-    # ------------------------------------------------------------------
-    # Hook: run correction and update session exit status
-    # ------------------------------------------------------------------
-
     def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
         self._apply_correction()
         if any(not r.passed for r in self._corrected):
             session.exitstatus = pytest.ExitCode.TESTS_FAILED
-
-    # ------------------------------------------------------------------
-    # Hook: update terminal stats and print summary
-    # ------------------------------------------------------------------
 
     def pytest_terminal_summary(self, terminalreporter, exitstatus: int, config: pytest.Config) -> None:
         if not self._corrected:
@@ -459,11 +311,6 @@ class FamilywisePlugin:
             f"\n  {n_passed} passed, {n_failed} failed "
             f"after {label} correction"
         )
-
-
-# ---------------------------------------------------------------------------
-# Plugin registration
-# ---------------------------------------------------------------------------
 
 def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption(
@@ -536,9 +383,7 @@ def assertNotReject(request: pytest.FixtureRequest) -> PValueReporter:
     callable that recomputes *this test's* p-value under H0.  It receives a
     seeded ``numpy`` generator and must transform the **observed** data so as to
     impose H0 — permute labels, sign-flip, center-then-bootstrap — rather than
-    drawing fresh data from an assumed-true model (which is only valid when H0
-    actually holds, and throws away the dependence structure Westfall-Young
-    exists to exploit):
+    drawing fresh data from an assumed-true model.
 
     ```python
     def test_mean_zero(assertNotReject, data):
@@ -555,8 +400,7 @@ def assertNotReject(request: pytest.FixtureRequest) -> PValueReporter:
     The ``rng`` for resample *b* is seeded identically in every test, so two
     tests that apply the same transform to the same data see the same draw and
     their null columns stay aligned — which is what lets the procedure exploit
-    their correlation.  Tests whose transforms differ still get valid results,
-    just with less of a power gain over Holm.
+    their correlation.
     """
     plugin: FamilywisePlugin = request.config._familywise_plugin  # type: ignore[attr-defined]
     reporter = PValueReporter(
