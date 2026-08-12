@@ -234,121 +234,42 @@ pytest --groupsize=40
 
 Every test draws one group of 40, the plugin applies the step-down correction
 to the whole family, tests whose null is rejected stop, and the survivors draw
-another group.  The number of groups follows from the same sample-size planning
-as before.  Nothing in the tests changes — that is what the sampler contract
-buys:
-
-```
-============ Holm-Bonferroni correction  α=0.05  n=3  groupsize=40 =============
-  FAILED  p=0.000144  adjusted p=0.000433  looks=1/4  examples/group_sequential.py::test_biased_coin
-  PASSED  p=0.294538  adjusted p=0.589077  looks=4/4  examples/group_sequential.py::test_normal_mean_zero
-  PASSED  p=0.375008  adjusted p=0.589077  looks=2/2  examples/group_sequential.py::test_uniform_marginals
-
-  2 passed, 1 failed after Holm-Bonferroni correction
-```
-
-The broken test cost one group instead of four.  `looks=1/4` is the audit
-trail: how many groups were drawn, out of how many were planned.
-
-### Why the group p-values give an exact boundary
+another group. 
 
 Each look draws a *fresh, independent* group, and the sampler returns the
 p-value for that group alone.  So under $H_0$ the group p-values $p_1, \dotsc,
 p_K$ are independent and uniform.  Probit-transform and accumulate them:
 
-$$X_j = \Phi^{-1}(1 - p_j) \sim \mathcal{N}(0,1), \qquad S_k = \sum_{j \le k} X_j, \qquad Z_k = \frac{S_k}{\sqrt{k}}.$$
+$$X_j = \Phi^{-1}(1 - p_j) \sim \mathcal{N}(0,1), \qquad S_k = \sum_{j \le k} X_j$$
 
-Then $Z_k \sim \mathcal{N}(0,1)$ and, for $j \le k$,
-
-$$\operatorname{Cov}(Z_j, Z_k) = \frac{\operatorname{Var}(S_j)}{\sqrt{jk}} = \sqrt{j/k}.$$
-
-That is exactly the canonical joint distribution the group-sequential
-literature assumes — and here it holds *by construction*, for a KS test or a
-chi-square test or anything else, because the only inputs were independence of
-the groups and uniformity of a p-value.  No asymptotics, no assumption about
-the underlying statistic.  Applied directly to cumulative KS or chi-square
-statistics it would not hold, which is what usually makes exact
-group-sequential boundaries unavailable to a test-agnostic tool.
-
-(If a test's p-value is *super*-uniform — discrete statistics like `binomtest`
-— then $X_j$ is stochastically smaller than $\mathcal{N}(0,1)$ and everything
-below is conservative rather than exact.)
-
-### Pocock's boundary
-
-A group-sequential design rejects at the first look crossing a boundary
-$b_1, \dotsc, b_K$ chosen so that
-
-$$P_{H_0}\!\left(\exists\, k \le K : Z_k \ge b_k\right) = \alpha .$$
-
-One equation, $K$ unknowns — so a *shape* has to be fixed first.  The two
-classical ones are
-
-$$\textbf{Pocock: } b_k = c_K(\alpha)\ \text{(constant)} \qquad\qquad \textbf{O'Brien-Fleming: } b_k = c'_K(\alpha)/\sqrt{k} .$$
-
-Pocock spends $\alpha$ evenly, so the nominal per-look threshold is the same
-every look; it maximises the chance of stopping early at the cost of the
-largest maximum sample size.  O'Brien-Fleming is near-impossible to cross early
-and hoards $\alpha$ for the final look.  For a test suite, stopping early on a
-broken test is the entire point, so this plugin uses Pocock.
-
-$c_K$ grows slowly: at $\alpha = 0.05$ one-sided, the nominal per-look level
-falls from $0.05$ at $K=1$ to $0.0305$, $0.0233$ and $0.0169$ at $K = 2, 3, 5$.
-
-### One sequential p-value, then the usual correction
+Let $M_l = \max_{k \leq l} S_k$ and its survival function $G_l(b) = P_{H_0}(M_l \geq b)$. Our group-sequential design will reject at the first look crossing boundary $c_K(\alpha)$. For us to have family-wise error rate $\alpha$, we must have $G_K(c_K(\alpha)) = \alpha$. 
 
 Rather than compare $Z_k$ to $c_K$ at each look, the plugin inverts the
-boundary into a **sequential p-value**
+boundary into a **sequential p-value** $p^{*}_L = G_K(M_L)$ where $M_L$ is observed after $L$ looks. As $G$ is monotonically decreasing, $p^*_L \leq \alpha \iff G_K(M_L) \leq G_K(c_K(\alpha)) \iff M_L \geq c_K(\alpha)$, so our group-sequential scheme is equivalent to rejecting when $p^*_L \leq \alpha$. 
 
-$$p^{*} = P_{H_0}\!\left(\max_{k \le K} Z_k \ \ge\ \max_{k \le L} Z_k\right)$$
+To compute $p^*_L$, recurse on the density $f_k$ of $S_k$ given that no earlier look crossed:
 
-after $L$ looks.  Since $p^{*} \le \alpha \iff \max_k Z_k \ge c_K(\alpha)$ this
-is the Pocock rule exactly, but on the p-value scale — so Holm and
-Westfall-Young apply unchanged, and $p^{*}$ is what the summary reports.  Under
-$H_0$ at $L = K$ it is uniform, i.e. an honest p-value.  At $K = 1$ it is just
-$p_1$, which is why running without `--groupsize` behaves exactly as before.
+$$f_1(s) = \varphi(s), \qquad f_{k+1}(s) = \int_{-\infty}^{\,b\sqrt{k}} f_k(u)\, \varphi(s - u)\, du,$$
 
-Crossing probabilities are computed by the Armitage–McPherson recursion on the
-sub-density $f_k$ of $S_k$ given that no earlier look crossed:
-
-$$f_1(s) = \varphi(s - \delta), \qquad f_{k+1}(s) = \int_{-\infty}^{\,b\sqrt{k}} f_k(u)\, \varphi(s - u - \delta)\, du,$$
-
-$$P_\delta\!\left(\exists\, k \le K : Z_k \ge b\right) = 1 - \int_{-\infty}^{\,b\sqrt{K}} f_K(s)\, ds .$$
+$$G(b) = 1 - \int_{-\infty}^b f_K(s)\, ds .$$
 
 Independent increments turn a $K$-dimensional orthant probability into $K$
-one-dimensional convolutions.  With $\delta = 0$ this gives the boundary and
-the p-value; with $\delta = \mu$ it gives the design's power, so one routine
-serves all three.  It is used in preference to
-`scipy.stats.multivariate_normal.cdf` because that routine is randomised
-quasi-Monte-Carlo: it varies run to run by around $10^{-5}$ — enough to flip a
-borderline verdict between two runs on identical data — and it costs 0.5 s per
-call at $K=10$ against well under a millisecond here.
+one-dimensional convolutions.  
 
-### Why running the correction at every look is still valid
+### Fitting everything together
 
-$\max_{k \le L} Z_k$ is non-decreasing in $L$, so every $p^{*}$ is
-non-increasing across looks.  Holm's and Westfall-Young's adjusted p-values are
-coordinatewise non-decreasing in the p-value vector, so the adjusted values are
-non-increasing across looks too.  Therefore
+During testing, we repeat the following $K$ times:
 
-$$\{\text{test } i \text{ rejected at some look}\} = \{\text{test } i \text{ rejected at look } K\},$$
-
-and the whole procedure is equivalent to applying the correction *once*, at
-look $K$, to a vector of valid p-values.  The FWER proofs above carry over
-verbatim with $p^{*}$ in place of $p$; the monitoring needs no new argument.
-
-The same monotonicity licenses early stopping.  A test stopping at look $L < K$
-freezes $p^{*}$ at a value no smaller than its full-$K$ value, which can only
-*raise* other tests' adjusted p-values (conservative) and only *lower* its own,
-so it stays rejected.  Read a stopped test's reported $p^{*}$ as an upper
-bound — `looks=L/K` marks exactly which ones those are.
+- Run all the remaining unit tests on the next group of observations, getting raw p-values for each test.
+- Adjust these raw p-values into sequential p values $p^*$.
+- Further adjust these sequential $p^*$ values into step-down $\tilde{p}$ values. 
+- Reject any tests for which $\tilde{p} \le \alpha$
 
 ### Planning the number of groups
 
-With per-group drift $\mu = \mathbb{E}[X_j]$ under the alternative, $Z_k$ has
-drift $\sqrt{k}\,\mu$, and $K$ is the smallest number of looks with
+With per-group drift $\mu = \mathbb{E}[X_j]$ under the alternative, $K$ is the smallest number of looks with
 
-$$P_{\mu}\!\left(\exists\, k \le K : Z_k \ge c_K(\alpha_i)\right) \ \ge\ 1 - \beta,$$
+$$P_{\mu}\left(M_K \ge c_K(\alpha_i)\right) \ \ge\ 1 - \beta$$
 
 at the same corrected level $\alpha_i = \alpha/m$ used everywhere else.  To get
 $\mu$ for a group of `--groupsize` samples, the sample-size functions are run
@@ -358,26 +279,7 @@ the probit-transformed p-value is normal with unit variance (the z-test) and an
 approximation otherwise — it selects the number of looks, so a poor $\mu$ costs
 power, never error-rate control.
 
-### Costs
 
-- **Combining $K$ groups is weaker than pooling $K \times$ `groupsize`
-  samples** for KS and chi-square (for z/t-type tests it is equivalent).  If a
-  single group has no power to detect your effect at all, no number of groups
-  will, and the plugin says so and names `--groupsize` as the lever.
-- **The test body runs once per look.**  Later looks re-run the test protocol,
-  which is what keeps every sampler inside a live call phase with its fixtures
-  set up and its exceptions reported as ordinary failures.  Put expensive setup
-  in a module- or session-scoped fixture, which pytest reuses across the reruns.
-- **Draw your data from the `rng` argument**, not from a fixture.  A sampler
-  reading its data from a module-scoped fixture would see the same observations
-  at every look, and the groups would not be independent.  This is the one part
-  of the contract the plugin cannot check for you.
-- **Incompatible with `pytest-xdist`**, which replaces the same hook the look
-  loop needs.  Using both is an error rather than a silent single look.
-- Under `--correction=westfall-young`, null resampling is deferred until some
-  test's $p^{*}$ actually reaches $\alpha$ — an adjusted p-value is never below
-  the raw one, so until then no rejection is possible and the resampling cannot
-  change a verdict.  A suite that never comes close pays nothing.
 
 ## CLI options
 
